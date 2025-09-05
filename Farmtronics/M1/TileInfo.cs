@@ -84,6 +84,18 @@ namespace Farmtronics.M1 {
 				result["waterLeft"] = new ValNumber(can.WaterLeft);
 				result["waterMax"] = new ValNumber(can.waterCanMax);
 			}
+			if (item is Chest chest) {
+				result["itemCount"] = new ValNumber(chest.Items.Count);
+			}
+			if (item.HasContextTag("sign_item")) { // wood sign, stone sign
+				if (item is Sign sign) {
+					result["label"] = new ValString(sign.displayItem?.Value?.Name);
+				}
+			}
+			if (item.itemId.Value == "TextSign") { // text sign
+				object value = item.GetType().GetProperty("SignText").GetValue(item);
+				result["label"] = new ValString($"{value}");
+			}
 			return result;
 		}
 
