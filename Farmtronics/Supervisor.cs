@@ -11,220 +11,217 @@ using StardewValley;
 using StardewValley.Locations;
 
 namespace Farmtronics {
-	internal sealed class SupervisorSnapshot {
-		public List<SupervisorLocationSnapshot> Locations { get; } = new();
-		public List<SupervisorBotSnapshot> Bots { get; } = new();
-	}
+    internal sealed class Supervisor
+    {
+        private enum SupervisorMode
+        {
+            Idle,
+            AllBotsRockTest,
+            SingleBotRockTest
+        }
 
-	internal sealed class SupervisorLocationSnapshot {
-		public string Name { get; init; }
-		public int Width { get; init; }
-		public int Height { get; init; }
-	}
+        private enum BotMode
+        {
+            Idle,           // bot is supervised but has no current work
+            Planning,       // supervisor should try to create a plan
+            Queued,         // plan exists but script has not been sent yet
+            Running,        // script has been queued/sent; shell is executing
+            Cooldown,       // bot is waiting briefly before planning again
+            Paused,         // bot cannot currently act, e.g. wrong location
+        }
 
-	internal sealed class SupervisorBotSnapshot {
-		public string Name { get; init; }
-		public string LocationName { get; init; }
-		public Vector2 TileLocation { get; init; }
-		public int Facing { get; init; }
-	}
+        private sealed class BotSupervisorState
+        {
+            public BotObject Bot;
+            public string BotName;
+            public BotMode Mode;
+            public PendingPlan CurrentPlan;
+            public Vector2 LastObservedTile;
+            public TimeSpan LastMovementAt;
+            public TimeSpan NextAllowedPlanAt;
+            public string LastNoPlanReason;
+        }
 
-	internal sealed class Supervisor {
-		private sealed class PendingPlan {
-			public BotObject Bot { get; init; }
-			public Vector2 TargetTile { get; init; }
-			public string TargetName { get; init; }
-			public Vector2 StartTile { get; init; }
-			public string Script { get; init; }
-			public TimeSpan? QueuedAt { get; set; }
+        private sealed class PendingPlan
+        {
+            public Vector2 TargetTile { get; init; }
+            public string TargetName { get; init; }
+            public Vector2 AdjacentTile { get; init; }
+            public Vector2 StartTile { get; init; }
+            public string Script { get; init; }
+            public TimeSpan? QueuedAt { get; set; }
 		}
 
-		private sealed class TargetCandidate {
-			public string TargetName { get; init; }
-			public Vector2 TargetTile { get; init; }
-			public Vector2 AdjacentTile { get; init; }
-			public float DistanceSquared { get; init; }
-		}
+        private sealed class TargetCandidate
+        {
+            public string TargetName { get; init; }
+            public Vector2 TargetTile { get; init; }
+            public Vector2 AdjacentTile { get; init; }
+            public float DistanceSquared { get; init; }
+        }
 
-		private enum Mode {
-			Idle,
-			SingleBotRockTest,
-			AllBotsRockTest,
-		}
+        private SupervisorMode mode = SupervisorMode.Idle;
+        private readonly Dictionary<string, BotSupervisorState> botStates = new();
+        private readonly Dictionary<string, TimeSpan> blockedTargets = new();
 
-		private static readonly TimeSpan planTimeout = TimeSpan.FromSeconds(15);
+        private void LoadBotStatesToSupervisor(bool singleBot = false)
+        {
+            botStates.Clear();
+
+            foreach (var bot in BotManager.GetAllBots()
+                .Where(candidate => candidate?.currentLocation is Farm))
+            {
+                bot.InitShell();
+
+                var botState = new BotSupervisorState
+                {
+                    Bot = bot,
+                    BotName = bot.name,
+                    Mode = BotMode.Planning,
+                    CurrentPlan = null,
+                    LastObservedTile = bot.TileLocation,
+                    LastMovementAt = Game1.currentGameTime.TotalGameTime,
+                    NextAllowedPlanAt = TimeSpan.Zero,
+                };
+
+                botStates[bot.name] = botState;
+
+                ModEntry.instance.Monitor.Log(
+                    $"Supervisor loaded bot {bot.name} at tile {bot.TileLocation.X},{bot.TileLocation.Y}.");
+
+                if (singleBot) break;
+            }
+
+            if (botStates.Count == 0)
+            {
+                ModEntry.instance.Monitor.Log("Supervisor found no farm bots to supervise.");
+            }
+        }
+        
 		private static readonly HashSet<string> clearTypes = new() { "Grass", "Stone", "Twig", "Weeds", "Bush" };
+		private static readonly TimeSpan blockedCooldown = TimeSpan.FromSeconds(6);
+		private static readonly TimeSpan stuckTimeout = TimeSpan.FromSeconds(2);
 		private static readonly ValString planStatusKey = new("supervisorPlanStatus");
-		private readonly List<PendingPlan> pendingPlans = new();
-		private readonly Dictionary<string, PendingPlan> activePlansByBot = new();
-		private Mode mode = Mode.Idle;
 
-		public SupervisorSnapshot Snapshot() {
-			var snapshot = new SupervisorSnapshot();
+		public void Reset()
+        {
+            mode = SupervisorMode.Idle;
+            botStates.Clear();
+            blockedTargets.Clear();
+            ModEntry.instance.Monitor.Log("Supervisor reset.");
+        }
 
-			foreach (var location in Game1.locations) {
-				snapshot.Locations.Add(new SupervisorLocationSnapshot {
-					Name = location.NameOrUniqueName,
-					Width = location.map.Layers[0].LayerWidth,
-					Height = location.map.Layers[0].LayerHeight,
-				});
-			}
+        public void Stop()
+        {
+            mode = SupervisorMode.Idle;
+            botStates.Clear();
+            blockedTargets.Clear();
+            ModEntry.instance.Monitor.Log("Supervisor stopped.");
+        }
 
-			foreach (var bot in BotManager.GetAllBots()) {
-				if (bot == null) continue;
-				snapshot.Bots.Add(new SupervisorBotSnapshot {
-					Name = bot.name,
-					LocationName = bot.currentLocation?.NameOrUniqueName,
-					TileLocation = bot.TileLocation,
-					Facing = bot.facingDirection,
-				});
-			}
-
-			return snapshot;
-		}
-
-		public void Reset() {
-			mode = Mode.Idle;
-			pendingPlans.Clear();
-			activePlansByBot.Clear();
-			ModEntry.instance.Monitor.Log("Supervisor reset.");
-		}
-
-		public void Stop() {
-			mode = Mode.Idle;
-			pendingPlans.Clear();
-			activePlansByBot.Clear();
-			ModEntry.instance.Monitor.Log("Supervisor stopped.");
-		}
-
-		public void StartSingleBotRockTest() {
-			mode = Mode.SingleBotRockTest;
-			pendingPlans.Clear();
-			activePlansByBot.Clear();
-			QueuePlansForFirstLoadedBot();
-			ModEntry.instance.Monitor.Log("Supervisor started: single-bot rock test.");
-		}
+		public void StartSingleBotRockTest()
+        {
+            mode = SupervisorMode.SingleBotRockTest;
+            blockedTargets.Clear();
+            LoadBotStatesToSupervisor(singleBot: true);
+            ModEntry.instance.Monitor.Log("Supervisor started: single-bot rock test.");
+        }
 
 		public void StartAllBotsRockTest() {
-			mode = Mode.AllBotsRockTest;
-			pendingPlans.Clear();
-			activePlansByBot.Clear();
-			QueuePlansForAllLoadedBots();
+			mode = SupervisorMode.AllBotsRockTest;
+			blockedTargets.Clear();
+			LoadBotStatesToSupervisor(singleBot: false);
 			ModEntry.instance.Monitor.Log("Supervisor started: all-bots rock test.");
 		}
+        public void Update(GameTime gameTime)
+        {
+            if (!Context.IsMainPlayer) return;
+            if (!Context.IsWorldReady) return;
+            if (mode == SupervisorMode.Idle) return;
 
-		public void Update(GameTime gameTime) {
-			if (!Context.IsMainPlayer) return;
-			if (!Context.IsWorldReady) return;
-			if (mode == Mode.Idle) return;
-			if (pendingPlans.Count == 0) return;
+            TimeSpan now = gameTime.TotalGameTime;
+            CleanupBlockedTargets(now);
 
-			TimeSpan now = gameTime.TotalGameTime;
-			for (int i = pendingPlans.Count - 1; i >= 0; i--) {
-				var plan = pendingPlans[i];
-				if (plan.Bot == null || plan.Bot.shell == null) {
-					RemovePlan(plan);
-					continue;
-				}
+            foreach (var state in botStates.Values.ToList())
+            {
+                UpdateBotState(state, now);
+            }
+        }
 
-				string planStatus = GetPlanStatus(plan.Bot);
-				if (planStatus == "success") {
-					ModEntry.instance.Monitor.Log($"Supervisor plan completed for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
-					RemovePlan(plan);
-					QueueNextPlanForBot(plan.Bot);
-					continue;
-				}
+        private void UpdateBotState(BotSupervisorState state, TimeSpan now)
+        {
+            var bot = state.Bot;
+            if (bot == null)
+            {
+                state.Mode = BotMode.Idle;
+                state.LastNoPlanReason = "Bot object is null.";
+                return;
+            }
 
-				if (planStatus == "failed") {
-					ModEntry.instance.Monitor.Log($"Supervisor plan failed for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
-					RemovePlan(plan);
-					QueueNextPlanForBot(plan.Bot);
-					continue;
-				}
+            var location = bot.currentLocation;
+            if (location == null || location.NameOrUniqueName != "Farm")
+            {
+                state.Mode = BotMode.Paused;
+                state.LastNoPlanReason = "Bot is not on the farm.";
+                return;
+            }
 
-				if (plan.Bot.currentLocation != Game1.currentLocation) continue;
+            switch (state.Mode)
+            {
+                case BotMode.Planning:
+                    if (now < state.NextAllowedPlanAt)
+                    {
+                        state.LastNoPlanReason = $"Waiting for cooldown: {state.NextAllowedPlanAt - now:mm\\:ss}";
+                        break;
+                    }
 
-				bool targetStillExists = IsClearableTile(plan.Bot.currentLocation, plan.TargetTile);
-				if (plan.QueuedAt.HasValue) {
-					if (now - plan.QueuedAt.Value >= planTimeout) {
-						ModEntry.instance.Monitor.Log($"Supervisor plan failed/timed out for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
-						plan.Bot.shell.Break(true);
-						RemovePlan(plan);
-						QueueNextPlanForBot(plan.Bot);
-						continue;
-					}
-					continue;
-				}
+                    TryCreatePlanForBot(state, now);
+                break;
 
-				if (!plan.Bot.shell.IsReadyForCommand()) continue;
-				if (plan.Bot.shell.HasQueuedCommands()) continue;
+                case BotMode.Queued:
+                    if (bot.shell.IsReadyForCommand())
+                    {
+                        ModEntry.instance.Monitor.Log($"Supervisor sending script to {bot.name} for target tile {state.CurrentPlan.TargetTile.X},{state.CurrentPlan.TargetTile.Y} name {state.CurrentPlan.TargetName}");
+                        bot.shell.QueueCommand(state.CurrentPlan.Script);
+                        state.CurrentPlan.QueuedAt = now;
+                        state.LastObservedTile = bot.TileLocation;
+                        state.LastMovementAt = now;
+                        state.Mode = BotMode.Running;
+                    }
+                    break;
 
-				ModEntry.instance.Monitor.Log($"Supervisor queued plan for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
-				plan.Bot.shell.QueueCommand(plan.Script);
-				plan.QueuedAt = now;
-			}
+                case BotMode.Running:
+                    UpdateMovementTracking(state, now);
+                    if (now - state.LastMovementAt >= stuckTimeout)
+                    {
+                        ModEntry.instance.Monitor.Log($"Supervisor plan stuck for {bot.name}: no movement at {state.LastObservedTile.X},{state.LastObservedTile.Y} targeting {state.CurrentPlan.TargetTile.X},{state.CurrentPlan.TargetTile.Y} name {state.CurrentPlan.TargetName}");
+                        bot.shell.Break(true);
+                        FailPlan(state, now);
+                        break;
+                    }
+                    string planStatus = GetPlanStatus(bot);
+                    if (planStatus == "success")
+                    {
+                        ModEntry.instance.Monitor.Log($"Supervisor plan completed for {bot.name}: target {state.CurrentPlan.TargetTile.X},{state.CurrentPlan.TargetTile.Y} name {state.CurrentPlan.TargetName}");
+                        state.CurrentPlan = null;
+                        state.Mode = BotMode.Planning;
+                    }
+                    else if (planStatus == "failed")
+                    {
+                        ModEntry.instance.Monitor.Log($"Supervisor plan failed for {bot.name}: target {state.CurrentPlan.TargetTile.X},{state.CurrentPlan.TargetTile.Y} name {state.CurrentPlan.TargetName}");
+                        FailPlan(state, now);
+                    }
+                    break;
 
-			if (pendingPlans.Count == 0) {
-				mode = Mode.Idle;
-			}
-		}
-
-		private void QueuePlansForFirstLoadedBot() {
-			var bot = BotManager.GetAllBots().FirstOrDefault(candidate => candidate?.currentLocation is Farm);
-			if (bot == null) {
-				ModEntry.instance.Monitor.Log("Supervisor could not find a loaded bot on a farm.");
-				return;
-			}
-
-			QueueNextPlanForBot(bot);
-		}
-
-		private void QueuePlansForAllLoadedBots() {
-			foreach (var bot in BotManager.GetAllBots().Where(candidate => candidate?.currentLocation is Farm)) {
-				QueueNextPlanForBot(bot);
-			}
-
-			if (pendingPlans.Count == 0) {
-				ModEntry.instance.Monitor.Log("Supervisor could not build any bot plans.");
-			}
-		}
-
-		private void QueueNextPlanForBot(BotObject bot) {
-			if (bot == null) return;
-			if (activePlansByBot.TryGetValue(bot.name, out var activePlan)) {
-				ModEntry.instance.Monitor.Log($"Supervisor skipped duplicate plan for {bot.name}: target tile {activePlan.TargetTile.X},{activePlan.TargetTile.Y} name {activePlan.TargetName}");
-				return;
-			}
-
-			bot.InitShell();
-
-			var farm = bot.currentLocation as Farm;
-			if (farm == null) return;
-
-			var candidates = FindTargetCandidates(farm, bot.TileLocation)
-				.OrderBy(candidate => candidate.DistanceSquared)
-				.ToList();
-
-			var candidate = candidates.FirstOrDefault();
-			if (candidate == null) return;
-
-			var path = FindPath(farm, bot.TileLocation, candidate.AdjacentTile);
-			if (path == null) return;
-
-			var script = BuildScript(bot.TileLocation, bot.facingDirection, path, candidate.TargetTile, candidate.TargetName, farm);
-			if (string.IsNullOrWhiteSpace(script)) return;
-
-			pendingPlans.Add(new PendingPlan {
-				Bot = bot,
-				TargetTile = candidate.TargetTile,
-				TargetName = candidate.TargetName,
-				StartTile = bot.TileLocation,
-				Script = script,
-			});
-			activePlansByBot[bot.name] = pendingPlans[^1];
-			ModEntry.instance.Monitor.Log($"Supervisor queued plan for {bot.name}: target tile {candidate.TargetTile.X},{candidate.TargetTile.Y} name {candidate.TargetName}");
-		}
-
+                case BotMode.Cooldown:
+                    if (now >= state.NextAllowedPlanAt)
+                    {
+                        state.Mode = BotMode.Planning;
+                        state.LastNoPlanReason = null;
+                    }
+                    break;
+            }
+        }   
 		private IEnumerable<TargetCandidate> FindTargetCandidates(Farm farm, Vector2 fromTile) {
 			int width = farm.map.Layers[0].LayerWidth;
 			int height = farm.map.Layers[0].LayerHeight;
@@ -247,7 +244,81 @@ namespace Farmtronics {
 				}
 			}
 		}
+        private void TryCreatePlanForBot(BotSupervisorState state, TimeSpan now)
+        {
+            var bot = state.Bot;
+            if (bot == null)
+            {
+                state.Mode = BotMode.Paused;
+                state.LastNoPlanReason = "Bot is null.";
+                return;
+            }
 
+            var farm = bot.currentLocation as Farm;
+            if (farm == null)
+            {
+                state.Mode = BotMode.Paused;
+                state.LastNoPlanReason = "Bot is not on a farm.";
+                return;
+            }
+
+            var candidates = FindTargetCandidates(farm, bot.TileLocation)
+                .OrderBy(candidate => candidate.DistanceSquared)
+                .ToList();
+
+            foreach (var candidate in candidates)
+            {
+                if (IsTargetBlocked(farm, candidate.TargetTile, now))
+                    continue;
+
+                var path = FindPath(farm, bot.TileLocation, candidate.AdjacentTile);
+                if (path == null)
+                {
+                    BlockTarget(farm, candidate.TargetTile, now);
+                    continue;
+                }
+
+                var script = BuildScript(
+                    bot.TileLocation,
+                    bot.facingDirection,
+                    path,
+                    candidate.TargetTile,
+                    candidate.TargetName,
+                    farm);
+
+                if (string.IsNullOrWhiteSpace(script))
+                {
+                    BlockTarget(farm, candidate.TargetTile, now);
+                    continue;
+                }
+
+                bot.InitShell();
+
+                state.CurrentPlan = new PendingPlan
+                {
+                    TargetTile = candidate.TargetTile,
+                    TargetName = candidate.TargetName,
+                    StartTile = bot.TileLocation,
+                    Script = script,
+                    QueuedAt = null,
+                };
+
+                state.Mode = BotMode.Queued;
+                state.LastNoPlanReason = null;
+
+                ModEntry.instance.Monitor.Log(
+                    $"Supervisor created plan for {bot.name}: target tile {candidate.TargetTile.X},{candidate.TargetTile.Y} name {candidate.TargetName}");
+
+                return;
+            }
+
+            state.CurrentPlan = null;
+            state.Mode = BotMode.Idle;
+            state.LastNoPlanReason = "No reachable clearable target found.";
+
+            ModEntry.instance.Monitor.Log(
+                $"Supervisor has no plan for {bot.name}: {state.LastNoPlanReason}");
+        }
 		private bool IsClearableTile(GameLocation location, Vector2 tile, out string targetName) {
 			targetName = null;
 			ValMap info = TileInfo.GetInfo(location, tile);
@@ -276,7 +347,7 @@ namespace Farmtronics {
 
 			foreach (var candidate in candidates) {
 				if (!IsWithinMap(location, candidate)) continue;
-				if (TileInfo.IsPassable(location, candidate)) yield return candidate;
+				if (IsSupervisorPassable(location, candidate)) yield return candidate;
 			}
 		}
 
@@ -319,7 +390,7 @@ namespace Farmtronics {
 
 			foreach (var candidate in candidates) {
 				if (!IsWithinMap(location, candidate)) continue;
-				if (TileInfo.IsPassable(location, candidate)) yield return candidate;
+				if (IsSupervisorPassable(location, candidate)) yield return candidate;
 			}
 		}
 
@@ -328,9 +399,9 @@ namespace Farmtronics {
 			int facing = startFacing;
 			Vector2 current = startTile;
 
+			lines.Add("supervisorPlanStatus = \"running\"");
 			lines.Add("run = function");
 			lines.Add("    clearTypes = [\"Grass\", \"Stone\", \"Twig\", \"Weeds\", \"Bush\"]");
-			lines.Add("    supervisorPlanStatus = \"running\"");
 			lines.Add("    farm = me.position.area");
 			lines.Add("    moveStep = function(expectedFacing, dx, dy)");
 			lines.Add("        print \"Current tile: \" + me.position.x + \",\" + me.position.y");
@@ -338,7 +409,7 @@ namespace Farmtronics {
 			lines.Add("        print \"Destination tile: \" + (me.position.x + dx) + \",\" + (me.position.y + dy)");
 			lines.Add("        if me.facing != expectedFacing then");
 			lines.Add("            print \"Facing mismatch: expected \" + expectedFacing + \" got \" + me.facing");
-			lines.Add("            supervisorPlanStatus = \"failed\"");
+			lines.Add("            globals.supervisorPlanStatus = \"failed\"");
 			lines.Add("            return false");
 			lines.Add("        end if");
 			lines.Add("        startX = me.position.x");
@@ -346,7 +417,7 @@ namespace Farmtronics {
 			lines.Add("        me.forward");
 			lines.Add("        if me.position.x != startX + dx or me.position.y != startY + dy then");
 			lines.Add("            print \"Movement mismatch: expected \" + (startX + dx) + \",\" + (startY + dy) + \" got \" + me.position.x + \",\" + me.position.y");
-			lines.Add("            supervisorPlanStatus = \"failed\"");
+			lines.Add("            globals.supervisorPlanStatus = \"failed\"");
 			lines.Add("            return false");
 			lines.Add("        end if");
 			lines.Add("        return true");
@@ -369,13 +440,13 @@ namespace Farmtronics {
 			lines.Add("    expectedY = " + current.Y);
 			lines.Add("    if me.position.x != expectedX or me.position.y != expectedY then");
 			lines.Add("        print \"Target mismatch: expected position \" + expectedX + \",\" + expectedY + \" got \" + me.position.x + \",\" + me.position.y");
-			lines.Add("        supervisorPlanStatus = \"failed\"");
+			lines.Add("        globals.supervisorPlanStatus = \"failed\"");
 			lines.Add("        return false");
 			lines.Add("    end if");
 			lines.Add("    inTile = me.ahead");
 			lines.Add("    what = \"nothing\"");
 			lines.Add("    if inTile then");
-			lines.Add("        what = inTile.type");
+			lines.Add("        if inTile.hasIndex(\"type\") then what = inTile.type");
 			lines.Add("        if inTile.hasIndex(\"name\") then what = inTile.name");
 			lines.Add("    end if");
 			lines.Add("    print \"Ahead tile: \" + what");
@@ -385,8 +456,11 @@ namespace Farmtronics {
 			lines.Add("        else if inTile.hasIndex(\"name\") and clearTypes.indexOf(inTile.name) > -1 then");
 			lines.Add("            me.clearAhead");
 			lines.Add("        end if");
+            lines.Add("        wait 1");
+			lines.Add("        globals.supervisorPlanStatus = \"success\"");
+			lines.Add("        return true");
 			lines.Add("    end if");
-			lines.Add("    supervisorPlanStatus = \"success\"");
+			lines.Add("    globals.supervisorPlanStatus = \"success\"");
 			lines.Add("    return true");
 			lines.Add("end function");
 			lines.Add("run");
@@ -438,10 +512,46 @@ namespace Farmtronics {
 			return tile.X >= 0 && tile.Y >= 0 && tile.X < width && tile.Y < height;
 		}
 
-		private void RemovePlan(PendingPlan plan) {
-			if (plan == null) return;
-			pendingPlans.Remove(plan);
-			if (plan.Bot != null) activePlansByBot.Remove(plan.Bot.name);
+		private void FailPlan(BotSupervisorState state, TimeSpan now) {
+			if (state?.CurrentPlan == null) return;
+			BlockTarget(state.Bot?.currentLocation, state.CurrentPlan.TargetTile, now);
+			state.CurrentPlan = null;
+			state.NextAllowedPlanAt = now + blockedCooldown;
+			state.Mode = BotMode.Cooldown;
+		}
+
+		private void UpdateMovementTracking(BotSupervisorState state, TimeSpan now) {
+			if (state?.Bot == null) return;
+			var currentTile = state.Bot.TileLocation;
+			if (currentTile == state.LastObservedTile) return;
+			state.LastObservedTile = currentTile;
+			state.LastMovementAt = now;
+		}
+
+		private bool IsTargetBlocked(GameLocation location, Vector2 tile, TimeSpan now) {
+			string key = GetBlockedTargetKey(location, tile);
+			if (!blockedTargets.TryGetValue(key, out TimeSpan blockedUntil)) return false;
+			if (now >= blockedUntil) {
+				blockedTargets.Remove(key);
+				return false;
+			}
+			return true;
+		}
+
+		private void BlockTarget(GameLocation location, Vector2 tile, TimeSpan now) {
+			if (location == null) return;
+			blockedTargets[GetBlockedTargetKey(location, tile)] = now + blockedCooldown;
+		}
+
+		private void CleanupBlockedTargets(TimeSpan now) {
+			if (blockedTargets.Count == 0) return;
+			var expired = blockedTargets.Where(entry => entry.Value <= now).Select(entry => entry.Key).ToList();
+			foreach (var key in expired) blockedTargets.Remove(key);
+		}
+
+		private static string GetBlockedTargetKey(GameLocation location, Vector2 tile) {
+			string locationName = location?.NameOrUniqueName ?? "";
+			return locationName + ":" + tile.X + "," + tile.Y;
 		}
 
 		private string GetPlanStatus(BotObject bot) {
@@ -449,5 +559,24 @@ namespace Farmtronics {
 			if (!bot.shell.interpreter.vm.globalContext.variables.map.TryGetValue(planStatusKey, out Value statusValue)) return null;
 			return statusValue?.ToString();
 		}
+        private bool IsSupervisorPassable(GameLocation location, Vector2 tile) {
+            if (!IsWithinMap(location, tile)) return false;
+
+            ValMap info = TileInfo.GetInfo(location, tile);
+            if (info == null) return true;
+
+            string typeName = info.GetString("type");
+            string objectName = info.GetString("name");
+
+            // SMAPI/Farmtronics may report Building passable,
+            // but bots cannot path through structures.
+            if (typeName == "Building" || objectName == "Building") return false;
+
+            // Also probably not pathable as ordinary walk tiles.
+            if (typeName == "Bush" || objectName == "Bush") return false;
+
+            return TileInfo.IsPassable(location, tile);
+        }
+
 	}
 }
