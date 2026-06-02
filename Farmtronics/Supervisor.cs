@@ -54,7 +54,9 @@ namespace Farmtronics {
 
 		private static readonly TimeSpan planTimeout = TimeSpan.FromSeconds(15);
 		private static readonly HashSet<string> clearTypes = new() { "Grass", "Stone", "Twig", "Weeds", "Bush" };
+		private static readonly ValString planStatusKey = new("supervisorPlanStatus");
 		private readonly List<PendingPlan> pendingPlans = new();
+		private readonly Dictionary<string, PendingPlan> activePlansByBot = new();
 		private Mode mode = Mode.Idle;
 
 		public SupervisorSnapshot Snapshot() {
@@ -84,18 +86,21 @@ namespace Farmtronics {
 		public void Reset() {
 			mode = Mode.Idle;
 			pendingPlans.Clear();
+			activePlansByBot.Clear();
 			ModEntry.instance.Monitor.Log("Supervisor reset.");
 		}
 
 		public void Stop() {
 			mode = Mode.Idle;
 			pendingPlans.Clear();
+			activePlansByBot.Clear();
 			ModEntry.instance.Monitor.Log("Supervisor stopped.");
 		}
 
 		public void StartSingleBotRockTest() {
 			mode = Mode.SingleBotRockTest;
 			pendingPlans.Clear();
+			activePlansByBot.Clear();
 			QueuePlansForFirstLoadedBot();
 			ModEntry.instance.Monitor.Log("Supervisor started: single-bot rock test.");
 		}
@@ -103,6 +108,7 @@ namespace Farmtronics {
 		public void StartAllBotsRockTest() {
 			mode = Mode.AllBotsRockTest;
 			pendingPlans.Clear();
+			activePlansByBot.Clear();
 			QueuePlansForAllLoadedBots();
 			ModEntry.instance.Monitor.Log("Supervisor started: all-bots rock test.");
 		}
@@ -117,7 +123,22 @@ namespace Farmtronics {
 			for (int i = pendingPlans.Count - 1; i >= 0; i--) {
 				var plan = pendingPlans[i];
 				if (plan.Bot == null || plan.Bot.shell == null) {
-					pendingPlans.RemoveAt(i);
+					RemovePlan(plan);
+					continue;
+				}
+
+				string planStatus = GetPlanStatus(plan.Bot);
+				if (planStatus == "success") {
+					ModEntry.instance.Monitor.Log($"Supervisor plan completed for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
+					RemovePlan(plan);
+					QueueNextPlanForBot(plan.Bot);
+					continue;
+				}
+
+				if (planStatus == "failed") {
+					ModEntry.instance.Monitor.Log($"Supervisor plan failed for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
+					RemovePlan(plan);
+					QueueNextPlanForBot(plan.Bot);
 					continue;
 				}
 
@@ -125,23 +146,12 @@ namespace Farmtronics {
 
 				bool targetStillExists = IsClearableTile(plan.Bot.currentLocation, plan.TargetTile);
 				if (plan.QueuedAt.HasValue) {
-					if (!targetStillExists) {
-						ModEntry.instance.Monitor.Log($"Supervisor cleared {plan.TargetName} for {plan.Bot.name}.");
-						pendingPlans.RemoveAt(i);
-						QueueNextPlanForBot(plan.Bot);
-						continue;
-					}
-
 					if (now - plan.QueuedAt.Value >= planTimeout) {
-						ModEntry.instance.Monitor.Log($"Supervisor giving up on {plan.Bot.name}'s {plan.TargetName} and moving on.");
+						ModEntry.instance.Monitor.Log($"Supervisor plan failed/timed out for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
 						plan.Bot.shell.Break(true);
-						pendingPlans.RemoveAt(i);
+						RemovePlan(plan);
 						QueueNextPlanForBot(plan.Bot);
 						continue;
-					}
-
-					if (plan.Bot.shell.IsReadyForCommand()) {
-						pendingPlans.RemoveAt(i);
 					}
 					continue;
 				}
@@ -149,7 +159,7 @@ namespace Farmtronics {
 				if (!plan.Bot.shell.IsReadyForCommand()) continue;
 				if (plan.Bot.shell.HasQueuedCommands()) continue;
 
-				ModEntry.instance.Monitor.Log($"Supervisor queueing for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
+				ModEntry.instance.Monitor.Log($"Supervisor queued plan for {plan.Bot.name}: target tile {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
 				plan.Bot.shell.QueueCommand(plan.Script);
 				plan.QueuedAt = now;
 			}
@@ -180,6 +190,12 @@ namespace Farmtronics {
 		}
 
 		private void QueueNextPlanForBot(BotObject bot) {
+			if (bot == null) return;
+			if (activePlansByBot.TryGetValue(bot.name, out var activePlan)) {
+				ModEntry.instance.Monitor.Log($"Supervisor skipped duplicate plan for {bot.name}: target tile {activePlan.TargetTile.X},{activePlan.TargetTile.Y} name {activePlan.TargetName}");
+				return;
+			}
+
 			bot.InitShell();
 
 			var farm = bot.currentLocation as Farm;
@@ -205,7 +221,8 @@ namespace Farmtronics {
 				StartTile = bot.TileLocation,
 				Script = script,
 			});
-			ModEntry.instance.Monitor.Log($"Supervisor queueing for {bot.name}: target tile {candidate.TargetTile.X},{candidate.TargetTile.Y} name {candidate.TargetName}");
+			activePlansByBot[bot.name] = pendingPlans[^1];
+			ModEntry.instance.Monitor.Log($"Supervisor queued plan for {bot.name}: target tile {candidate.TargetTile.X},{candidate.TargetTile.Y} name {candidate.TargetName}");
 		}
 
 		private IEnumerable<TargetCandidate> FindTargetCandidates(Farm farm, Vector2 fromTile) {
@@ -313,6 +330,7 @@ namespace Farmtronics {
 
 			lines.Add("run = function");
 			lines.Add("    clearTypes = [\"Grass\", \"Stone\", \"Twig\", \"Weeds\", \"Bush\"]");
+			lines.Add("    supervisorPlanStatus = \"running\"");
 			lines.Add("    farm = me.position.area");
 			lines.Add("    moveStep = function(expectedFacing, dx, dy)");
 			lines.Add("        print \"Current tile: \" + me.position.x + \",\" + me.position.y");
@@ -320,6 +338,7 @@ namespace Farmtronics {
 			lines.Add("        print \"Destination tile: \" + (me.position.x + dx) + \",\" + (me.position.y + dy)");
 			lines.Add("        if me.facing != expectedFacing then");
 			lines.Add("            print \"Facing mismatch: expected \" + expectedFacing + \" got \" + me.facing");
+			lines.Add("            supervisorPlanStatus = \"failed\"");
 			lines.Add("            return false");
 			lines.Add("        end if");
 			lines.Add("        startX = me.position.x");
@@ -327,6 +346,7 @@ namespace Farmtronics {
 			lines.Add("        me.forward");
 			lines.Add("        if me.position.x != startX + dx or me.position.y != startY + dy then");
 			lines.Add("            print \"Movement mismatch: expected \" + (startX + dx) + \",\" + (startY + dy) + \" got \" + me.position.x + \",\" + me.position.y");
+			lines.Add("            supervisorPlanStatus = \"failed\"");
 			lines.Add("            return false");
 			lines.Add("        end if");
 			lines.Add("        return true");
@@ -349,6 +369,7 @@ namespace Farmtronics {
 			lines.Add("    expectedY = " + current.Y);
 			lines.Add("    if me.position.x != expectedX or me.position.y != expectedY then");
 			lines.Add("        print \"Target mismatch: expected position \" + expectedX + \",\" + expectedY + \" got \" + me.position.x + \",\" + me.position.y");
+			lines.Add("        supervisorPlanStatus = \"failed\"");
 			lines.Add("        return false");
 			lines.Add("    end if");
 			lines.Add("    inTile = me.ahead");
@@ -365,6 +386,7 @@ namespace Farmtronics {
 			lines.Add("            me.clearAhead");
 			lines.Add("        end if");
 			lines.Add("    end if");
+			lines.Add("    supervisorPlanStatus = \"success\"");
 			lines.Add("    return true");
 			lines.Add("end function");
 			lines.Add("run");
@@ -414,6 +436,18 @@ namespace Farmtronics {
 			int width = location.map.Layers[0].LayerWidth;
 			int height = location.map.Layers[0].LayerHeight;
 			return tile.X >= 0 && tile.Y >= 0 && tile.X < width && tile.Y < height;
+		}
+
+		private void RemovePlan(PendingPlan plan) {
+			if (plan == null) return;
+			pendingPlans.Remove(plan);
+			if (plan.Bot != null) activePlansByBot.Remove(plan.Bot.name);
+		}
+
+		private string GetPlanStatus(BotObject bot) {
+			if (bot?.shell?.interpreter?.vm?.globalContext?.variables == null) return null;
+			if (!bot.shell.interpreter.vm.globalContext.variables.map.TryGetValue(planStatusKey, out Value statusValue)) return null;
+			return statusValue?.ToString();
 		}
 	}
 }
