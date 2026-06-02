@@ -28,6 +28,7 @@ namespace Farmtronics.Bot {
 		// LookupAnything suggests that everything is fine in game.
 		const int parentSheetIndex_c = 0xB07;
 		const string internalID_c = "Farmtronics_Bot";
+		const int TileSize = 64;
 
 		// We need a Farmer to be able to use tools.  So, we're going to
 		// create our own invisible Farmer instance and store it here:
@@ -529,21 +530,23 @@ namespace Farmtronics.Bot {
 			else if (dColumn < 0) farmer.faceDirection(3);
 			else if (dColumn > 0) farmer.faceDirection(1);
 
-			// make sure the terrain in that direction isn't blocked
-			Vector2 newTile = farmer.Tile + new Vector2(dColumn, dRow);
+			// Keep tile-space and pixel-space explicit at the movement boundary.
+			Point tilePos = new Point(Position.GetIntX() / TileSize, Position.GetIntY() / TileSize);
+			Vector2 pixelPos = Position;
+			Vector2 newTile = new Vector2(tilePos.X + dColumn, tilePos.Y + dRow);
 
 			// make sure the terrain in that direction isn't blocked
 			bool isPassable = TileInfo.IsPassable(currentLocation, newTile);
 			if (!isPassable) {
 				ModEntry.instance.Monitor.Log($"MoveForward: tile {newTile} is not passable");
-				targetPos = Position;
+				targetPos = pixelPos;
 				return;
 			}
 
 			// start moving
-			targetPos = newTile.GetAbsolutePosition();
+			targetPos = new Vector2(newTile.X * TileSize, newTile.Y * TileSize);
 			#if DEBUG
-			ModEntry.instance.Monitor.Log($"MoveForward: Facing: {facingDirection}; Position: {Position}; newTile: {newTile}; targetPos: {targetPos}");
+			ModEntry.instance.Monitor.Log($"MoveForward: Facing: {facingDirection}; tilePos: {tilePos}; pixelPos: {pixelPos}; newTile: {newTile}; targetPos(px): {targetPos}");
 			#endif
 
 			// Do collision actions (shake the grass, etc.)

@@ -92,6 +92,22 @@ namespace Farmtronics.Bot {
 			}
 		}
 
+		public static IEnumerable<BotObject> GetAllBots() {
+			foreach (var bot in instances) {
+				if (bot != null) yield return bot;
+			}
+
+			foreach (var playerBots in remoteInstances.Values) {
+				foreach (var bot in playerBots) {
+					if (bot != null) yield return bot;
+				}
+			}
+		}
+
+		public static BotObject GetFirstBot() {
+			return GetAllBots().FirstOrDefault();
+		}
+
 		public static void ClearAll() {
 			instances.Clear();
 			remoteInstances.Clear();

@@ -25,6 +25,7 @@ namespace Farmtronics
 		const string internalID_c = "Farmtronics_Bot";
 
 		internal static RealFileDisk sysDisk;
+		private readonly Supervisor supervisor = new();
 		
 		Shell shell;
 		
@@ -81,6 +82,7 @@ namespace Farmtronics
 			DiskController.ClearInstances();
 			BotManager.botCount = 0;
 			shell = null;
+			supervisor.Reset();
 		}
 
 		private void UpdateTicking(object sender, UpdateTickingEventArgs e) {
@@ -92,6 +94,7 @@ namespace Farmtronics
 
 			// update all bots
 			BotManager.UpdateAll(gameTime);
+			supervisor.Update(gameTime);
 		}
 		
 		// NOTE: Only check the mailbox once per day and only when the player warps to the farm
@@ -117,7 +120,6 @@ namespace Farmtronics
 			Helper.Events.Player.Warped -= OnPlayerWarped;
 		}
 
-#if DEBUG
 		// HACK used only for early testing/development:
 		public void OnButtonPressed(object sender, ButtonPressedEventArgs e) {
 			//this.Monitor.Log($"OnButtonPressed: {e.Button}");
@@ -133,6 +135,19 @@ namespace Farmtronics
 				//Game1.currentLocation.dropObject(bot, pos, Game1.viewport, true, (Farmer)null);
 				Game1.player.currentLocation.setObject(tilePos, bot);
 				BotManager.instances.Add(bot);
+				break;
+
+			case SButton.F9:
+				Monitor.Log("F9 pressed: starting single-bot rock test.");
+				supervisor.StartSingleBotRockTest();
+				break;
+			case SButton.F10:
+				Monitor.Log("F10 pressed: starting all-bots rock test.");
+				supervisor.StartAllBotsRockTest();
+				break;
+			case SButton.F11:
+				Monitor.Log("F11 pressed: stopping supervisor.");
+				supervisor.Stop();
 				break;
 			
 			case SButton.PageDown:
@@ -159,7 +174,6 @@ namespace Farmtronics
 				break;
 			}
 		}
-#endif
 		
 		public void OnMenuChanged(object sender, MenuChangedEventArgs e) {
 			Monitor.Log($"Menu opened: {e.NewMenu}");

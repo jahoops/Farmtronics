@@ -48,6 +48,7 @@ namespace Farmtronics.M1 {
 		public Interpreter interpreter { get; private set; }
 		public bool runProgram;
 		public string inputReceived;		// stores input while app is running, for _input intrinsic
+		private readonly Queue<string> queuedCommands = new();
 
 		ValString curStatusColor;
 		ValString curScreenColor;
@@ -177,6 +178,8 @@ namespace Farmtronics.M1 {
 				Value sourceVal = interpreter.GetGlobalValue("_source");
 				string source = (sourceVal == null ? null : sourceVal.JoinToString());
 				BeginRun(source);
+			} else if (queuedCommands.Count > 0) {
+				HandleCommand(queuedCommands.Dequeue());
 			} else {
 				// nothing running; get another command!
 				GetCommand();
@@ -235,6 +238,19 @@ namespace Farmtronics.M1 {
 			runningInstance = this;
 			FixHostInfo();
 			interpreter.REPL(command, 0.1f);
+		}
+
+		public void QueueCommand(string command) {
+			if (string.IsNullOrWhiteSpace(command)) return;
+			queuedCommands.Enqueue(command);
+		}
+
+		public bool IsReadyForCommand() {
+			return interpreter != null && !interpreter.Running() && !interpreter.NeedMoreInput();
+		}
+
+		public bool HasQueuedCommands() {
+			return queuedCommands.Count > 0;
 		}
 	
 		void BeginRun(string source) {

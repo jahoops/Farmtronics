@@ -4,6 +4,7 @@
     <Copyright>Copyright © $([System.DateTime]::UtcNow.Year) Joe Strout ($([System.DateTime]::UtcNow.ToString("s")))</Copyright>
     <TargetFramework>net6.0</TargetFramework>
     <ModFolderName>Farmtronics</ModFolderName>
+    <GamePath>/home/j/.local/share/Steam/steamapps/common/Stardew Valley</GamePath>
     <BundleExtraAssemblies>ThirdParty</BundleExtraAssemblies>
     <ReleaseVersion>1.4.1</ReleaseVersion>
   </PropertyGroup>

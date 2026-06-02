@@ -270,21 +270,6 @@ namespace Farmtronics.M1 {
 				}
 				return result;
 			}
-
-#if DEBUG
-			// for debugging: check properties in various layers
-			string[] layers = {"Front", "Back", "Buildings", "Paths", "AlwaysFront"};
-			foreach (string layer in layers) {
-				var mapLayer = loc.map.GetLayer(layer);
-				if (mapLayer == null) continue;
-				var tile = mapLayer.PickTile(tileLocation, Game1.viewport.Size);
-				if (tile == null) continue;
-				foreach (var kv in tile.TileIndexProperties) {
-					ModEntry.instance.Monitor.Log($"layer {layer}, {kv.Key} = {kv.Value}");
-				}
-			}
-#endif
-
 			// If there is nothing at all of interest, return null rather
 			// than a map that contains only passable:true (and a type).
 			if (result.map[_passable].BoolValue()) return null;
