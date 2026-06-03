@@ -171,6 +171,7 @@ namespace Farmtronics.Bot {
 		// Apply the currently-selected item as a tool (or weapon) on
 		// the square in front of the bot.
 		public void UseTool() {
+			EnsureBotEnergy();
 			float oldStamina = farmer.stamina;
 			if (farmer.CurrentTool == null && 
 			    farmer.Items[farmer.CurrentToolIndex].QualifiedItemId.Equals("(O)787"))
@@ -220,6 +221,13 @@ namespace Farmtronics.Bot {
 				// We'll actually apply the tool effect later, in Update.
 				scytheUseFrame = 1;
 			}
+		}
+
+		private void EnsureBotEnergy()
+		{
+			if (farmer == null) return;
+
+			farmer.Stamina = Math.Max(farmer.Stamina, farmer.MaxStamina);
 		}
 
 		// Attempt to harvest the crop in front of the bot.

@@ -98,16 +98,17 @@ namespace Farmtronics {
             }
         }
         
-		private static readonly HashSet<string> clearTypes = new() { "Grass", "Stone", "Twig", "Weeds", "Bush" };
+		private static readonly HashSet<string> clearTypes = new() { "Grass", "Stone", "Twig", "Weeds" };
 		private static readonly TimeSpan blockedCooldown = TimeSpan.FromSeconds(6);
 		private static readonly TimeSpan stuckTimeout = TimeSpan.FromSeconds(2);
-		private static readonly ValString planStatusKey = new("supervisorPlanStatus");
-
+        private readonly Dictionary<string, int> targetFailureCounts = new();
+        private static readonly int maxTargetFailures = 2;
 		public void Reset()
         {
             mode = SupervisorMode.Idle;
             botStates.Clear();
             blockedTargets.Clear();
+            targetFailureCounts.Clear();
             ModEntry.instance.Monitor.Log("Supervisor reset.");
         }
 
@@ -116,6 +117,7 @@ namespace Farmtronics {
             mode = SupervisorMode.Idle;
             botStates.Clear();
             blockedTargets.Clear();
+            targetFailureCounts.Clear();
             ModEntry.instance.Monitor.Log("Supervisor stopped.");
         }
 
@@ -123,6 +125,7 @@ namespace Farmtronics {
         {
             mode = SupervisorMode.SingleBotRockTest;
             blockedTargets.Clear();
+            targetFailureCounts.Clear();
             LoadBotStatesToSupervisor(singleBot: true);
             ModEntry.instance.Monitor.Log("Supervisor started: single-bot rock test.");
         }
@@ -130,6 +133,7 @@ namespace Farmtronics {
 		public void StartAllBotsRockTest() {
 			mode = SupervisorMode.AllBotsRockTest;
 			blockedTargets.Clear();
+			targetFailureCounts.Clear();
 			LoadBotStatesToSupervisor(singleBot: false);
 			ModEntry.instance.Monitor.Log("Supervisor started: all-bots rock test.");
 		}
@@ -202,9 +206,21 @@ namespace Farmtronics {
                     string planStatus = GetPlanStatus(bot);
                     if (planStatus == "success")
                     {
-                        ModEntry.instance.Monitor.Log($"Supervisor plan completed for {bot.name}: target {state.CurrentPlan.TargetTile.X},{state.CurrentPlan.TargetTile.Y} name {state.CurrentPlan.TargetName}");
+                        var plan = state.CurrentPlan;
                         state.CurrentPlan = null;
-                        state.Mode = BotMode.Planning;
+                        if (IsClearableTile(bot.currentLocation, plan.TargetTile))
+                        {
+                            ModEntry.instance.Monitor.Log($"Supervisor: target {plan.TargetTile.X},{plan.TargetTile.Y} still clearable after attempt for {bot.name}; recording failure.");
+                            RecordTargetFailure(bot.currentLocation, plan.TargetTile);
+                            BlockTarget(bot.currentLocation, plan.TargetTile, now);
+                            state.NextAllowedPlanAt = now + blockedCooldown;
+                            state.Mode = BotMode.Cooldown;
+                        }
+                        else
+                        {
+                            ModEntry.instance.Monitor.Log($"Supervisor plan completed for {bot.name}: target {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
+                            state.Mode = BotMode.Planning;
+                        }
                     }
                     else if (planStatus == "failed")
                     {
@@ -268,6 +284,8 @@ namespace Farmtronics {
 
             foreach (var candidate in candidates)
             {
+                if (IsTargetIgnored(farm, candidate.TargetTile))
+                    continue;
                 if (IsTargetBlocked(farm, candidate.TargetTile, now))
                     continue;
 
@@ -399,9 +417,8 @@ namespace Farmtronics {
 			int facing = startFacing;
 			Vector2 current = startTile;
 
-			lines.Add("supervisorPlanStatus = \"running\"");
 			lines.Add("run = function");
-			lines.Add("    clearTypes = [\"Grass\", \"Stone\", \"Twig\", \"Weeds\", \"Bush\"]");
+			lines.Add("    clearTypes = [\"Grass\", \"Stone\", \"Twig\", \"Weeds\"]");
 			lines.Add("    farm = me.position.area");
 			lines.Add("    moveStep = function(expectedFacing, dx, dy)");
 			lines.Add("        print \"Current tile: \" + me.position.x + \",\" + me.position.y");
@@ -409,7 +426,6 @@ namespace Farmtronics {
 			lines.Add("        print \"Destination tile: \" + (me.position.x + dx) + \",\" + (me.position.y + dy)");
 			lines.Add("        if me.facing != expectedFacing then");
 			lines.Add("            print \"Facing mismatch: expected \" + expectedFacing + \" got \" + me.facing");
-			lines.Add("            globals.supervisorPlanStatus = \"failed\"");
 			lines.Add("            return false");
 			lines.Add("        end if");
 			lines.Add("        startX = me.position.x");
@@ -417,7 +433,6 @@ namespace Farmtronics {
 			lines.Add("        me.forward");
 			lines.Add("        if me.position.x != startX + dx or me.position.y != startY + dy then");
 			lines.Add("            print \"Movement mismatch: expected \" + (startX + dx) + \",\" + (startY + dy) + \" got \" + me.position.x + \",\" + me.position.y");
-			lines.Add("            globals.supervisorPlanStatus = \"failed\"");
 			lines.Add("            return false");
 			lines.Add("        end if");
 			lines.Add("        return true");
@@ -440,7 +455,6 @@ namespace Farmtronics {
 			lines.Add("    expectedY = " + current.Y);
 			lines.Add("    if me.position.x != expectedX or me.position.y != expectedY then");
 			lines.Add("        print \"Target mismatch: expected position \" + expectedX + \",\" + expectedY + \" got \" + me.position.x + \",\" + me.position.y");
-			lines.Add("        globals.supervisorPlanStatus = \"failed\"");
 			lines.Add("        return false");
 			lines.Add("    end if");
 			lines.Add("    inTile = me.ahead");
@@ -451,16 +465,18 @@ namespace Farmtronics {
 			lines.Add("    end if");
 			lines.Add("    print \"Ahead tile: \" + what");
 			lines.Add("    if inTile then");
+			lines.Add("        cleared = false");
 			lines.Add("        if clearTypes.indexOf(inTile.type) > -1 then");
-			lines.Add("            me.clearAhead");
+			lines.Add("            cleared = me.clearAhead");
 			lines.Add("        else if inTile.hasIndex(\"name\") and clearTypes.indexOf(inTile.name) > -1 then");
-			lines.Add("            me.clearAhead");
+			lines.Add("            cleared = me.clearAhead");
+			lines.Add("        else");
+			lines.Add("            cleared = true  // nothing we recognize; treat as success");
 			lines.Add("        end if");
-            lines.Add("        wait 1");
-			lines.Add("        globals.supervisorPlanStatus = \"success\"");
-			lines.Add("        return true");
+			lines.Add("        if not cleared then");
+			lines.Add("            return false");
+			lines.Add("        end if");
 			lines.Add("    end if");
-			lines.Add("    globals.supervisorPlanStatus = \"success\"");
 			lines.Add("    return true");
 			lines.Add("end function");
 			lines.Add("run");
@@ -526,6 +542,21 @@ namespace Farmtronics {
 			if (currentTile == state.LastObservedTile) return;
 			state.LastObservedTile = currentTile;
 			state.LastMovementAt = now;
+		}
+
+		private void RecordTargetFailure(GameLocation location, Vector2 tile) {
+			if (location == null) return;
+			string key = GetBlockedTargetKey(location, tile);
+			targetFailureCounts.TryGetValue(key, out int count);
+			targetFailureCounts[key] = count + 1;
+			if (count + 1 >= maxTargetFailures)
+				ModEntry.instance.Monitor.Log($"Supervisor: target {tile.X},{tile.Y} failed {count + 1} times; permanently ignoring this run.");
+		}
+
+		private bool IsTargetIgnored(GameLocation location, Vector2 tile) {
+			if (location == null) return false;
+			string key = GetBlockedTargetKey(location, tile);
+			return targetFailureCounts.TryGetValue(key, out int count) && count >= maxTargetFailures;
 		}
 
 		private bool IsTargetBlocked(GameLocation location, Vector2 tile, TimeSpan now) {
