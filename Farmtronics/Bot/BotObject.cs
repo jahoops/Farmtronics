@@ -172,6 +172,10 @@ namespace Farmtronics.Bot {
 		// the square in front of the bot.
 		public void UseTool() {
 			EnsureBotEnergy();
+			if (farmer.CurrentTool is WateringCan wateringCan)
+			{
+				wateringCan.WaterLeft = wateringCan.waterCanMax;
+			}
 			float oldStamina = farmer.stamina;
 			if (farmer.CurrentTool == null && 
 			    farmer.Items[farmer.CurrentToolIndex].QualifiedItemId.Equals("(O)787"))
@@ -226,7 +230,6 @@ namespace Farmtronics.Bot {
 		private void EnsureBotEnergy()
 		{
 			if (farmer == null) return;
-
 			farmer.Stamina = Math.Max(farmer.Stamina, farmer.MaxStamina);
 		}
 

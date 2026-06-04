@@ -13,6 +13,13 @@ using StardewValley.Locations;
 namespace Farmtronics {
     internal sealed class Supervisor
     {
+
+        private enum JobType
+        {
+            ClearDebris,
+            WaterCrop,
+             // more later
+        }
         private enum SupervisorMode
         {
             Idle,
@@ -30,6 +37,18 @@ namespace Farmtronics {
             Paused,         // bot cannot currently act, e.g. wrong location
         }
 
+        private sealed class FarmJob
+        {
+            public JobType Type { get; init; }
+            public string JobKey { get; init; }
+
+            public string TargetName { get; init; }
+            public Vector2 TargetTile { get; init; }
+            public Vector2 AdjacentTile { get; init; }
+
+            public int BasePriority { get; init; }
+        }
+
         private sealed class BotSupervisorState
         {
             public BotObject Bot;
@@ -44,13 +63,17 @@ namespace Farmtronics {
 
         private sealed class PendingPlan
         {
+            public JobType JobType { get; init; }
+            public string JobKey { get; init; }
+
             public Vector2 TargetTile { get; init; }
             public string TargetName { get; init; }
             public Vector2 AdjacentTile { get; init; }
             public Vector2 StartTile { get; init; }
+
             public string Script { get; init; }
             public TimeSpan? QueuedAt { get; set; }
-		}
+        }
 
         private sealed class TargetCandidate
         {
@@ -196,37 +219,11 @@ namespace Farmtronics {
 
                 case BotMode.Running:
                     UpdateMovementTracking(state, now);
-                    if (now - state.LastMovementAt >= stuckTimeout)
-                    {
-                        ModEntry.instance.Monitor.Log($"Supervisor plan stuck for {bot.name}: no movement at {state.LastObservedTile.X},{state.LastObservedTile.Y} targeting {state.CurrentPlan.TargetTile.X},{state.CurrentPlan.TargetTile.Y} name {state.CurrentPlan.TargetName}");
-                        bot.shell.Break(true);
-                        FailPlan(state, now);
+
+                    if (!bot.shell.IsReadyForCommand() || bot.shell.HasQueuedCommands())
                         break;
-                    }
-                    string planStatus = GetPlanStatus(bot);
-                    if (planStatus == "success")
-                    {
-                        var plan = state.CurrentPlan;
-                        state.CurrentPlan = null;
-                        if (IsClearableTile(bot.currentLocation, plan.TargetTile))
-                        {
-                            ModEntry.instance.Monitor.Log($"Supervisor: target {plan.TargetTile.X},{plan.TargetTile.Y} still clearable after attempt for {bot.name}; recording failure.");
-                            RecordTargetFailure(bot.currentLocation, plan.TargetTile);
-                            BlockTarget(bot.currentLocation, plan.TargetTile, now);
-                            state.NextAllowedPlanAt = now + blockedCooldown;
-                            state.Mode = BotMode.Cooldown;
-                        }
-                        else
-                        {
-                            ModEntry.instance.Monitor.Log($"Supervisor plan completed for {bot.name}: target {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
-                            state.Mode = BotMode.Planning;
-                        }
-                    }
-                    else if (planStatus == "failed")
-                    {
-                        ModEntry.instance.Monitor.Log($"Supervisor plan failed for {bot.name}: target {state.CurrentPlan.TargetTile.X},{state.CurrentPlan.TargetTile.Y} name {state.CurrentPlan.TargetName}");
-                        FailPlan(state, now);
-                    }
+
+                    VerifyPlanResult(state, now);
                     break;
 
                 case BotMode.Cooldown:
@@ -238,28 +235,89 @@ namespace Farmtronics {
                     break;
             }
         }   
-		private IEnumerable<TargetCandidate> FindTargetCandidates(Farm farm, Vector2 fromTile) {
-			int width = farm.map.Layers[0].LayerWidth;
-			int height = farm.map.Layers[0].LayerHeight;
+        private void VerifyPlanResult(BotSupervisorState state, TimeSpan now)
+        {
+            var bot = state.Bot;
+            var plan = state.CurrentPlan;
 
-			for (int y = 0; y < height; y++) {
-				for (int x = 0; x < width; x++) {
-					var tile = new Vector2(x, y);
-					if (!IsClearableTile(farm, tile, out string targetName)) continue;
+            if (bot == null || plan == null)
+            {
+                state.CurrentPlan = null;
+                state.Mode = BotMode.Planning;
+                return;
+            }
 
-					var adjacentTiles = GetAdjacentPassableTiles(farm, tile).ToList();
-					if (adjacentTiles.Count == 0) continue;
+            if (IsJobStillNeeded(bot.currentLocation, plan))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"Supervisor: job still needed after attempt for {bot.name}: {plan.JobType} at {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
 
-					var adjacent = adjacentTiles.OrderBy(candidate => DistanceSquared(fromTile, candidate)).First();
-					yield return new TargetCandidate {
-						TargetName = targetName,
-						TargetTile = tile,
-						AdjacentTile = adjacent,
-						DistanceSquared = DistanceSquared(fromTile, tile),
-					};
-				}
-			}
-		}
+                RecordTargetFailure(bot.currentLocation, plan.TargetTile);
+                BlockTarget(bot.currentLocation, plan.TargetTile, now);
+
+                state.CurrentPlan = null;
+                state.NextAllowedPlanAt = now + blockedCooldown;
+                state.Mode = BotMode.Cooldown;
+                return;
+            }
+
+            ModEntry.instance.Monitor.Log(
+                $"Supervisor plan completed for {bot.name}: {plan.JobType} target {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
+
+            state.CurrentPlan = null;
+            state.Mode = BotMode.Planning;
+        }
+        private List<FarmJob> BuildFarmJobs(Farm farm)
+        {
+            var jobs = new List<FarmJob>();
+
+            int width = farm.map.Layers[0].LayerWidth;
+            int height = farm.map.Layers[0].LayerHeight;
+
+            for (int y = 0; y < height; y++)
+            {
+                for (int x = 0; x < width; x++)
+                {
+                    var tile = new Vector2(x, y);
+
+                    var adjacentTiles = GetAdjacentPassableTiles(farm, tile).ToList();
+                    if (adjacentTiles.Count == 0)
+                        continue;
+
+                    if (IsDryCropTile(farm, tile))  {
+                        jobs.Add(new FarmJob
+                        {
+                            Type = JobType.WaterCrop,
+                            JobKey = GetJobKey(farm, JobType.WaterCrop, tile),
+                            TargetName = "Dry Crop",
+                            TargetTile = tile,
+                            AdjacentTile = adjacentTiles.First(), // improve later
+                            BasePriority = 100,
+                        });   
+                        continue;                     
+                    }  
+
+                    if (IsClearableTile(farm, tile, out string targetName))
+                    jobs.Add(new FarmJob
+                    {
+                        Type = JobType.ClearDebris,
+                        JobKey = GetJobKey(farm, JobType.ClearDebris, tile),
+                        TargetName = targetName,
+                        TargetTile = tile,
+                        AdjacentTile = adjacentTiles.First(), // improve later
+                        BasePriority = 100,
+                    });
+
+                }
+            }
+
+            return jobs;
+        }
+        private static string GetJobKey(GameLocation location, JobType type, Vector2 tile)
+        {
+            string locationName = location?.NameOrUniqueName ?? "";
+            return $"{locationName}:{type}:{(int)tile.X},{(int)tile.Y}";
+        }
         private void TryCreatePlanForBot(BotSupervisorState state, TimeSpan now)
         {
             var bot = state.Bot;
@@ -278,21 +336,18 @@ namespace Farmtronics {
                 return;
             }
 
-            var candidates = FindTargetCandidates(farm, bot.TileLocation)
-                .OrderBy(candidate => candidate.DistanceSquared)
+            var jobs = BuildFarmJobs(farm)
+                .Where(job => !IsTargetIgnored(farm, job.TargetTile))
+                .Where(job => !IsTargetBlocked(farm, job.TargetTile, now))
+                .OrderByDescending(job => ScoreJobForBot(state, job))
                 .ToList();
 
-            foreach (var candidate in candidates)
+            foreach (var job in jobs)
             {
-                if (IsTargetIgnored(farm, candidate.TargetTile))
-                    continue;
-                if (IsTargetBlocked(farm, candidate.TargetTile, now))
-                    continue;
-
-                var path = FindPath(farm, bot.TileLocation, candidate.AdjacentTile);
+                var path = FindPath(farm, bot.TileLocation, job.AdjacentTile);
                 if (path == null)
                 {
-                    BlockTarget(farm, candidate.TargetTile, now);
+                    BlockTarget(farm, job.TargetTile, now);
                     continue;
                 }
 
@@ -300,13 +355,13 @@ namespace Farmtronics {
                     bot.TileLocation,
                     bot.facingDirection,
                     path,
-                    candidate.TargetTile,
-                    candidate.TargetName,
+                    job.TargetTile,
+                    job.TargetName,
                     farm);
 
                 if (string.IsNullOrWhiteSpace(script))
                 {
-                    BlockTarget(farm, candidate.TargetTile, now);
+                    BlockTarget(farm, job.TargetTile, now);
                     continue;
                 }
 
@@ -314,8 +369,10 @@ namespace Farmtronics {
 
                 state.CurrentPlan = new PendingPlan
                 {
-                    TargetTile = candidate.TargetTile,
-                    TargetName = candidate.TargetName,
+                    JobType = job.Type,
+                    JobKey = job.JobKey,
+                    TargetTile = job.TargetTile,
+                    TargetName = job.TargetName,
                     StartTile = bot.TileLocation,
                     Script = script,
                     QueuedAt = null,
@@ -325,7 +382,7 @@ namespace Farmtronics {
                 state.LastNoPlanReason = null;
 
                 ModEntry.instance.Monitor.Log(
-                    $"Supervisor created plan for {bot.name}: target tile {candidate.TargetTile.X},{candidate.TargetTile.Y} name {candidate.TargetName}");
+                    $"Supervisor created plan for {bot.name}: target tile {job.TargetTile.X},{job.TargetTile.Y} name {job.TargetName}");
 
                 return;
             }
@@ -351,6 +408,34 @@ namespace Farmtronics {
 			return true;
 		}
 
+        static bool IsDryCropTile(GameLocation location, Vector2 tile) {
+			ValMap info = TileInfo.GetInfo(location, tile);
+			if (info == null) return false;
+            bool isDryCrop = (info.GetString("dry") != null) && (info.GetString("crop") != null);
+            if (isDryCrop) {
+                return true;
+            }
+            return false;
+		}
+
+        private bool IsJobStillNeeded(GameLocation location, PendingPlan plan)
+{
+            return plan.JobType switch
+            {
+                JobType.ClearDebris => IsClearableTile(location, plan.TargetTile),
+                JobType.WaterCrop => IsDryCropTile(location, plan.TargetTile),
+                _ => false,
+            };
+        }
+        private static int ManhattanDistance(Vector2 a, Vector2 b)
+        {
+            return Math.Abs((int)a.X - (int)b.X) + Math.Abs((int)a.Y - (int)b.Y);
+        }
+        private int ScoreJobForBot(BotSupervisorState state, FarmJob job)
+        {
+            int distance = ManhattanDistance(state.Bot.TileLocation, job.AdjacentTile);
+            return job.BasePriority - distance * 10;
+        }
 		private bool IsClearableTile(GameLocation location, Vector2 tile) {
 			return IsClearableTile(location, tile, out _);
 		}
@@ -362,11 +447,11 @@ namespace Farmtronics {
 				tile + new Vector2(0, 1),
 				tile + new Vector2(-1, 0),
 			};
-
-			foreach (var candidate in candidates) {
-				if (!IsWithinMap(location, candidate)) continue;
-				if (IsSupervisorPassable(location, candidate)) yield return candidate;
-			}
+            foreach (var adjacentTile in candidates)
+            {
+                if (!IsWithinMap(location, adjacentTile)) continue;
+                if (IsSupervisorPassable(location, adjacentTile)) yield return adjacentTile;
+            }
 		}
 
 		private List<Vector2> FindPath(GameLocation location, Vector2 start, Vector2 goal) {
@@ -418,6 +503,16 @@ namespace Farmtronics {
 			Vector2 current = startTile;
 
 			lines.Add("run = function");
+            lines.Add("    selectInventoryByType = function(type)");
+            lines.Add("        for i in range(0,11)");
+            lines.Add("            item = me.inventory[i]");
+            lines.Add("            if item and item.hasIndex(\"type\") and item.type == type then");
+            lines.Add("                me.select i");
+            lines.Add("                return true");
+            lines.Add("            end if");
+            lines.Add("        end for");
+            lines.Add("        return false");
+            lines.Add("    end function");
 			lines.Add("    clearTypes = [\"Grass\", \"Stone\", \"Twig\", \"Weeds\"]");
 			lines.Add("    farm = me.position.area");
 			lines.Add("    moveStep = function(expectedFacing, dx, dy)");
@@ -450,6 +545,21 @@ namespace Farmtronics {
 
 			int finalFacing = FacingTowardTarget(current, targetTile);
 			if (finalFacing < 0) return null;
+            if(IsDryCropTile(farm, targetTile)) {
+                lines.Add("    print \"Using tool to water crop\"");
+                AppendTurns(lines, ref facing, finalFacing);
+                lines.Add("    if not selectInventoryByType(\"WateringCan\") then");
+                lines.Add("        print \"No watering can\"");
+                lines.Add("    else");        
+                lines.Add("        me.useTool");
+                lines.Add("    end if"); 
+            } else if (IsClearableTile(farm, targetTile, out _)) {
+                lines.Add("    print \"Clearing tile\"");
+                AppendTurns(lines, ref facing, finalFacing);
+                lines.Add("    me.clearAhead");
+            } else {
+                return null;
+            }
 			AppendTurns(lines, ref facing, finalFacing);
 			lines.Add("    expectedX = " + current.X);
 			lines.Add("    expectedY = " + current.Y);
@@ -464,19 +574,6 @@ namespace Farmtronics {
 			lines.Add("        if inTile.hasIndex(\"name\") then what = inTile.name");
 			lines.Add("    end if");
 			lines.Add("    print \"Ahead tile: \" + what");
-			lines.Add("    if inTile then");
-			lines.Add("        cleared = false");
-			lines.Add("        if clearTypes.indexOf(inTile.type) > -1 then");
-			lines.Add("            cleared = me.clearAhead");
-			lines.Add("        else if inTile.hasIndex(\"name\") and clearTypes.indexOf(inTile.name) > -1 then");
-			lines.Add("            cleared = me.clearAhead");
-			lines.Add("        else");
-			lines.Add("            cleared = true  // nothing we recognize; treat as success");
-			lines.Add("        end if");
-			lines.Add("        if not cleared then");
-			lines.Add("            return false");
-			lines.Add("        end if");
-			lines.Add("    end if");
 			lines.Add("    return true");
 			lines.Add("end function");
 			lines.Add("run");
@@ -585,12 +682,7 @@ namespace Farmtronics {
 			return locationName + ":" + tile.X + "," + tile.Y;
 		}
 
-		private string GetPlanStatus(BotObject bot) {
-			if (bot?.shell?.interpreter?.vm?.globalContext?.variables == null) return null;
-			if (!bot.shell.interpreter.vm.globalContext.variables.map.TryGetValue(planStatusKey, out Value statusValue)) return null;
-			return statusValue?.ToString();
-		}
-        private bool IsSupervisorPassable(GameLocation location, Vector2 tile) {
+		private static bool IsSupervisorPassable(GameLocation location, Vector2 tile) {
             if (!IsWithinMap(location, tile)) return false;
 
             ValMap info = TileInfo.GetInfo(location, tile);
