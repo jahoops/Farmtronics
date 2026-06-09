@@ -37,6 +37,9 @@ namespace Farmtronics.M1 {
 		static ValString _maxPhase = new ValString("maxPhase");
 		static ValString _harvestable = new ValString("harvestable");
 		static ValString _harvestMethod = new ValString("harvestMethod");
+		static ValString _tilled = new ValString("tilled");
+		static ValString _hasFertilizer = new ValString("hasFertilizer");
+		static ValString _indexOfHarvest = new ValString("indexOfHarvest");
 
 		public static ValMap ToMap(StardewValley.Object obj, ValMap result, bool passableOnly) {
 			string type = obj.Type;
@@ -121,6 +124,8 @@ namespace Farmtronics.M1 {
 			} else if (feature is HoeDirt hoeDirt) {
 				if (passableOnly) return result;
 				result.map[_dry] = ValNumber.Truth(hoeDirt.state.Value != 1);
+				result.map[_tilled] = ValNumber.one;
+				result.map[_hasFertilizer] = ValNumber.Truth(!string.IsNullOrEmpty(hoeDirt.fertilizer.Value));
 				var crop = hoeDirt.crop;
 				if (crop == null) result.map[_crop] = null;
 				else {
@@ -130,12 +135,12 @@ namespace Farmtronics.M1 {
 					cropInfo.map[_mature] = ValNumber.Truth(crop.fullyGrown.Value);
 					cropInfo.map[_dead] = ValNumber.Truth(crop.dead.Value);
 					cropInfo.map[_harvestMethod] = ValNumber.Truth(crop.GetHarvestMethod() == HarvestMethod.Grab);
+					if (int.TryParse(crop.indexOfHarvest.Value, out int harvestId))
+						cropInfo.map[_indexOfHarvest] = new ValNumber(harvestId);
 					bool harvestable = (int)crop.currentPhase.Value >= crop.phaseDays.Count - 1
 						&& (!crop.fullyGrown.Value || (int)crop.dayOfCurrentPhase.Value <= 0);
 					cropInfo.map[_harvestable] = ValNumber.Truth(harvestable);
 
-					//Note: we might be able to get the name of the crop
-					// using crop.indexOfHarvest or crop.netSeedIndex
 					var product = new StardewValley.Object(crop.indexOfHarvest.Value, 0);
 					cropInfo.map[_name] = new ValString(product.DisplayName);
 

@@ -32,7 +32,7 @@ namespace Farmtronics.Bot {
 
 		// We need a Farmer to be able to use tools.  So, we're going to
 		// create our own invisible Farmer instance and store it here:
-		BotFarmer farmer;
+		public BotFarmer farmer;
 		internal readonly ModData data;
 
 		public IList<Item> inventory { get { return farmer.Items; } }

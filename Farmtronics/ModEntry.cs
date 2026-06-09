@@ -38,7 +38,6 @@ namespace Farmtronics
 			MOD_ID = ModManifest.UniqueID;
 			localHelper = helper;
 			I18n.Init(helper.Translation);
-			
 #if DEBUG
 			// HACK not needed:
 			helper.Events.Input.ButtonPressed += OnButtonPressed;
@@ -121,49 +120,11 @@ namespace Farmtronics
 		}
 
 		// HACK used only for early testing/development:
-		public void OnButtonPressed(object sender, ButtonPressedEventArgs e) {
-			//this.Monitor.Log($"OnButtonPressed: {e.Button}");
+		private void OnButtonPressed(object sender, ButtonPressedEventArgs e) {
 			switch (e.Button) {
-			case SButton.PageUp:
-				// Create a bot.
-				Vector2 pos = Game1.player.position.Value;
-				pos.X -= Game1.tileSize;
-				Vector2 tilePos = pos.GetTilePosition();
-				var bot = new BotObject(tilePos);
-				bot.owner.Value = Game1.player.UniqueMultiplayerID;
-
-				//Game1.currentLocation.dropObject(bot, pos, Game1.viewport, true, (Farmer)null);
-				Game1.player.currentLocation.setObject(tilePos, bot);
-				BotManager.instances.Add(bot);
-				break;
-
-			case SButton.F9:
-				Monitor.Log("F9 pressed: starting single-bot rock test.");
-				supervisor.StartSingleBotRockTest();
-				break;
-			case SButton.F10:
-				Monitor.Log("F10 pressed: starting all-bots rock test.");
-				supervisor.StartAllBotsRockTest();
-				break;
-			case SButton.F11:
-				Monitor.Log("F11 pressed: stopping supervisor.");
-				supervisor.Stop();
-				break;
-			
-			case SButton.PageDown:
-				ToDoManager.MarkAllTasksDone();
-				Monitor.Log("All tasks solved!");
-				break;
-
-			case SButton.Insert:
-				Monitor.Log("Logging ModData of your bots...");
-				foreach (var instance in BotManager.instances) {
-					Monitor.Log($"Bot instance {instance.data}");
-				}
-				Monitor.Log("Done!");
-				break;
-				
-			case SButton.NumPad0:
+			case SButton.F5:
+				Monitor.Log("F5 pressed: return Farmer Position.");
+				supervisor.ReportFarmerPosition();
 				Vector2 mousePos = Helper.Input.GetCursorPosition().Tile;
 				Monitor.Log($"Performing lookup at mouse position: {mousePos}");
 				bool occupied = Game1.player.currentLocation.IsTileOccupiedBy(mousePos);
@@ -172,6 +133,35 @@ namespace Farmtronics
 				if (obj != null) name = obj.Name;
 				Monitor.Log($"Object Lookup result [occupied: {occupied}]: {name}");
 				break;
+			case SButton.F6:
+				Monitor.Log("F6 pressed: All Bots Report.");
+				supervisor.ReportAllBots();
+				break;
+			case SButton.F7:
+				Monitor.Log("F7 pressed: Warp All Bots to Me.");
+				supervisor.WarpAllBotsToPlayer();
+				break;
+			case SButton.F8 when !e.IsDown(SButton.LeftShift):
+				Monitor.Log("F8 pressed: Warp Myself Home.");
+				supervisor.WarpPlayerHome();
+				break;
+			case SButton.F8 when e.IsDown(SButton.LeftShift):
+				Monitor.Log("F8 pressed: Warp Myself to Mines.");
+				supervisor.WarpPlayerToMines();
+				break;
+			case SButton.F9:
+				Monitor.Log("F9 pressed: starting all bots.");
+				supervisor.StartAllBotsRockTest();
+				break;		
+			case SButton.F10:
+				ToDoManager.MarkAllTasksDone();
+				Monitor.Log("F10: Mark all tasks done.");
+				break;	
+			case SButton.F11:
+				Monitor.Log("F11 pressed: stopping supervisor.");
+				supervisor.Stop();
+				break;			
+
 			}
 		}
 		
