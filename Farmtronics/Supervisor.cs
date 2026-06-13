@@ -10,6 +10,7 @@ using Miniscript;
 using StardewModdingAPI;
 using StardewValley;
 using StardewValley.Locations;
+using StardewValley.Network;
 using StardewValley.Tools;
 
 namespace Farmtronics {
@@ -22,17 +23,15 @@ namespace Farmtronics {
             WaterCrop,
             PlantCrop,
             ClearDebris,
-
             ServiceMachine,
-
+            TillSoil,
             MineBreakStone,
             MineCutWeeds,
         }
         private enum SupervisorMode
         {
             Idle,
-            AllBotsRockTest,
-            SingleBotRockTest
+            AllBots,
         }
 
         private enum BotMode
@@ -76,12 +75,14 @@ namespace Farmtronics {
             public string JobKey { get; init; }
 
             public Vector2 TargetTile { get; init; }
+            public Vector2 StandTile { get; init; }
             public string TargetName { get; init; }
             public Vector2 AdjacentTile { get; init; }
             public Vector2 StartTile { get; init; }
 
             public string Script { get; init; }
             public TimeSpan? QueuedAt { get; set; }
+            public int RepathAttempts { get; set; }
         }
 
         private sealed class JobMemory
@@ -107,6 +108,36 @@ namespace Farmtronics {
         );
 
         private readonly Dictionary<Vector2, MachineServiceMemory> _machineServiceMemory = new();
+
+        private bool IsControllableBot(BotObject bot)
+        {
+            if (bot == null)
+                return false;
+
+            bool hasAnyTool =
+            bot.inventory.Any(item =>
+                item is Tool);
+            if (!hasAnyTool)
+            {
+                ModEntry.instance.Monitor.Log("Bot report: bot has no tools, giving tools");
+                bot.farmer.Items.AddRange(Farmer.initialTools());
+
+                // Inventory indices have to exist, since InventoryMenu exclusively uses them and can't assign items otherwise.
+                for (int i = bot.farmer.Items.Count; i < bot.GetActualCapacity(); i++) {
+                    bot.farmer.Items.Add(null);
+                }
+            }
+            hasAnyTool =
+            bot.inventory.Any(item =>
+                item is Tool);
+            if (!hasAnyTool)
+            {
+                ModEntry.instance.Monitor.Log("Bot report: bot has no tools, giving tools didn't work");
+                return false;
+            }
+            return true;
+        }
+
         private void LoadBotStatesToSupervisor(bool singleBot = false)
         {
             botStates.Clear();
@@ -119,16 +150,9 @@ namespace Farmtronics {
                     continue;
                 }
 
-                string locationName = bot.currentLocation?.NameOrUniqueName ?? "(null location)";
-
-                if (bot.currentLocation is not Farm && bot.currentLocation is not MineShaft)
-                {
-                    ModEntry.instance.Monitor.Log(
-                        $"Supervisor skipped {bot.name}: not on Farm or MineShaft; location={locationName}; tile={bot.TileLocation.X},{bot.TileLocation.Y}");
-                    continue;
+                if (IsControllableBot(bot)) {
+                    bot.InitShell();
                 }
-
-                bot.InitShell();
 
                 var botState = new BotSupervisorState
                 {
@@ -175,14 +199,14 @@ namespace Farmtronics {
                 LogLevel.Trace);
         }
 
-		private static readonly HashSet<string> clearTypes = new() { "Tree", "Stone", "Twig", "Weeds" };
+		private static readonly HashSet<string> clearTypes = new() { "Tree", "Stone", "Twig", "Weeds", "Grass" };
 		private static readonly TimeSpan blockedCooldown = TimeSpan.FromSeconds(6);
 		private static readonly TimeSpan stuckTimeout = TimeSpan.FromSeconds(2);
         private readonly Dictionary<string, int> targetFailureCounts = new();
         private static readonly int maxTargetFailures = 2;
         private sealed record MachineFingerprint(
             string Name,
-            string? HeldObjectName,
+            string HeldObjectName,
             int MinutesUntilReady,
             bool ReadyForHarvest
         );
@@ -197,7 +221,6 @@ namespace Farmtronics {
             );
         }
         private readonly Dictionary<Vector2, MachineFingerprint> _lastServicedMachines = new();
-
         private bool ShouldCreateServiceMachineJob(Vector2 tile, StardewValley.Object obj)
         {
             var now = Fingerprint(obj);
@@ -229,21 +252,12 @@ namespace Farmtronics {
             ModEntry.instance.Monitor.Log("Supervisor stopped.");
         }
 
-		public void StartSingleBotRockTest()
-        {
-            mode = SupervisorMode.SingleBotRockTest;
-            blockedTargets.Clear();
-            targetFailureCounts.Clear();
-            LoadBotStatesToSupervisor(singleBot: true);
-            ModEntry.instance.Monitor.Log("Supervisor started: single-bot rock test.");
-        }
-
-		public void StartAllBotsRockTest() {
-			mode = SupervisorMode.AllBotsRockTest;
+		public void StartAllBots() {
+			mode = SupervisorMode.AllBots;
 			blockedTargets.Clear();
 			targetFailureCounts.Clear();
 			LoadBotStatesToSupervisor(singleBot: false);
-			ModEntry.instance.Monitor.Log("Supervisor started: all-bots rock test.");
+			ModEntry.instance.Monitor.Log("Supervisor started: all-bots.");
 		}
         public void Update(GameTime gameTime)
         {
@@ -267,14 +281,6 @@ namespace Farmtronics {
             {
                 state.Mode = BotMode.Idle;
                 state.LastNoPlanReason = "Bot object is null.";
-                return;
-            }
-
-            var location = bot.currentLocation;
-            if (location == null || (location is not Farm && location is not MineShaft))
-            {
-                state.Mode = BotMode.Paused;
-                state.LastNoPlanReason = "Bot is not on the farm or in a mine.";
                 return;
             }
 
@@ -320,7 +326,7 @@ namespace Farmtronics {
                     break;
                 case BotMode.Idle:
                     state.CurrentPlan = null;
-                    state.NextAllowedPlanAt = now + TimeSpan.FromSeconds(60);
+                    state.NextAllowedPlanAt = now + TimeSpan.FromSeconds(30);
                     state.Mode = BotMode.Cooldown;
                     break;
             }
@@ -345,6 +351,72 @@ namespace Farmtronics {
                 $"suppressedUntil={now + machineFailedAttemptCooldown}",
                 LogLevel.Trace);
         }
+        private static Vector2 GetBotTile(BotObject bot)
+        {
+            return new Vector2(
+                (int)(bot.Position.X / 64),
+                (int)(bot.Position.Y / 64));
+        }
+        
+        private bool TryRepathCurrentPlan(BotSupervisorState state, TimeSpan now)
+        {
+            var bot = state.Bot;
+            var plan = state.CurrentPlan;
+
+            if (plan.RepathAttempts >= 3)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"Supervisor: giving up after {plan.RepathAttempts} repaths for {bot.name}: " +
+                    $"{plan.JobType} at {plan.TargetTile.X},{plan.TargetTile.Y}",
+                    LogLevel.Trace);
+
+                BlockTarget(bot.currentLocation, plan.TargetTile, now);
+                state.CurrentPlan = null;
+                state.NextAllowedPlanAt = now + blockedCooldown;
+                state.Mode = BotMode.Cooldown;
+                return false;
+            }
+
+            plan.RepathAttempts++;
+
+            if (bot == null || plan == null)
+                return false;
+
+            var location = bot.currentLocation;
+            var botTile = GetBotTile(bot);
+
+            // Target changed? Don't repath to a bad job.
+            if (!IsPlanStillValid(location, plan))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"Supervisor: cannot repath {bot.name}; target no longer valid: " +
+                    $"{plan.JobType} at {plan.TargetTile.X},{plan.TargetTile.Y}",
+                    LogLevel.Trace);
+
+                return false;
+            }
+
+            var path = FindPath(location, botTile, plan.StandTile);
+
+            if (path == null || path.Count == 0)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"Supervisor: repath failed for {bot.name}: " +
+                    $"from {botTile.X},{botTile.Y} to stand {plan.StandTile.X},{plan.StandTile.Y}",
+                    LogLevel.Trace);
+
+                return false;
+            }
+
+            ModEntry.instance.Monitor.Log(
+                $"Supervisor: repath succeeded for {bot.name}: " +
+                $"from {botTile.X},{botTile.Y} to {plan.StandTile.X},{plan.StandTile.Y}, steps={path.Count}",
+                LogLevel.Trace);
+
+            state.Mode = BotMode.Running;
+            state.NextAllowedPlanAt = now;
+            return true;
+        }
         private void VerifyPlanResult(BotSupervisorState state, TimeSpan now)
         {
             var bot = state.Bot;
@@ -354,6 +426,26 @@ namespace Farmtronics {
             {
                 state.CurrentPlan = null;
                 state.Mode = BotMode.Planning;
+                return;
+            }
+
+            if (plan.JobType == JobType.TillSoil && GetBotTile(bot) != plan.StandTile)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"Supervisor: {bot.name} drifted from expected stand tile for {plan.JobType}. " +
+                    $"bot={GetBotTile(bot).X},{GetBotTile(bot).Y} " +
+                    $"expected={plan.StandTile.X},{plan.StandTile.Y}; recalculating path.",
+                    LogLevel.Trace);
+
+                if (TryRepathCurrentPlan(state, now))
+                    return;
+
+                // If repath fails, then give up/block.
+                BlockTarget(bot.currentLocation, plan.TargetTile, now);
+
+                state.CurrentPlan = null;
+                state.NextAllowedPlanAt = now + blockedCooldown;
+                state.Mode = BotMode.Cooldown;
                 return;
             }
 
@@ -399,10 +491,44 @@ namespace Farmtronics {
             {
                 Farm farm => BuildFarmJobs(farm, state),
                 MineShaft mine => BuildMineJobs(mine, state),
+                Woods woods => BuildClearAllJobs(location, state),
+                Mountain mountain => BuildClearAllJobs(location, state),
                 _ => new List<BotJob>(),
             };
         }
+        private List<BotJob> BuildClearAllJobs(GameLocation location, BotSupervisorState state)
+        {
+            var jobs = new List<BotJob>();
 
+            int width = location.map.Layers[0].LayerWidth;
+            int height = location.map.Layers[0].LayerHeight;
+
+            for (int y = 0; y < height; y++)
+            {
+                for (int x = 0; x < width; x++)
+                {
+                    var tile = new Vector2(x, y);
+
+                    if (TryGetClearAllJob(location, tile, out string targetName))
+                    {
+                        var adjacentTiles = GetAdjacentPassableTiles(location, tile).ToList();
+                        if (adjacentTiles.Count == 0)
+                            continue;
+                        jobs.Add(new BotJob
+                        {
+                            Type = JobType.ClearDebris,
+                            JobKey = GetJobKey(location, JobType.ClearDebris, tile),
+                            TargetName = targetName,
+                            TargetTile = tile,
+                            AdjacentTile = adjacentTiles.First(),
+                            BasePriority = 100,
+                        });
+                    }
+                }
+            }
+
+            return jobs;
+        }
         private List<BotJob> BuildMineJobs(MineShaft mine, BotSupervisorState state)
         {
             var jobs = new List<BotJob>();
@@ -442,16 +568,34 @@ namespace Farmtronics {
 
             int width = farm.map.Layers[0].LayerWidth;
             int height = farm.map.Layers[0].LayerHeight;
-
-            for (int y = 12; y < height; y++)
+            // Machine Area
+            for (int y = 10; y < 22; y++)
             {
                 for (int x = 46; x < width; x++)
                 {
                     var tile = new Vector2(x, y);
+                    TimeSpan timestamp = new TimeSpan(DateTime.Now.Ticks);
+                    if (TryBuildMachineJob(farm, tile, timestamp,  out BotJob machineJob)) {
+                        jobs.Add(machineJob);
+                        continue;
+                    }  
+                }
+            }
+            // Crop Area
+            for (int y = 22; y < height; y++)
+            {
+                for (int x = 26; x < width; x++)
+                {
+                    var tile = new Vector2(x, y);
+
+                    //ModEntry.instance.Monitor.Log($"Building job for tile {tile.X},{tile.Y}", LogLevel.Trace);
+
 
                     var adjacentTiles = GetAdjacentPassableTiles(farm, tile).ToList();
-                    if (adjacentTiles.Count == 0)
-                        continue;
+                    if (adjacentTiles.Count == 0){
+                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} NO ADJACENT TILES", LogLevel.Trace);
+                        continue;                     
+                    }
                     if(IsHarvestableCropTile(farm, tile, out string targetName, out bool requiresScythe))  {
                         jobs.Add(new BotJob
                         {
@@ -462,6 +606,7 @@ namespace Farmtronics {
                             AdjacentTile = adjacentTiles.First(), // improve later
                             BasePriority = requiresScythe ? 120 : 110,
                         });   
+                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {targetName} \"HarvestCrop\"", LogLevel.Trace);
                         continue;                     
                     }
                     if(IsPlantCropTile(farm, tile, out string targetPlanting, out bool clearAhead, out bool canFertilize))  {
@@ -472,8 +617,10 @@ namespace Farmtronics {
                             TargetName = targetPlanting,
                             TargetTile = tile,
                             AdjacentTile = adjacentTiles.First(), // improve later
+                            BasePriority = 100 + (clearAhead ? 50 : 0) + (canFertilize ? 25 : 0),
                         });   
-                        continue;                     
+                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {targetPlanting} \"PlantCrop\"", LogLevel.Trace);
+                        continue;                                        
                     }
                     if (IsDryCropTile(farm, tile))  {
                         jobs.Add(new BotJob
@@ -485,23 +632,29 @@ namespace Farmtronics {
                             AdjacentTile = adjacentTiles.First(), // improve later
                             BasePriority = 100,
                         });   
+                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {targetName} \"WaterCrop\"", LogLevel.Trace);
+                        continue;                                         
+                    }      
+                    if (IsClearableTile(farm, tile, out string harvestName)) {
+                        jobs.Add(new BotJob
+                        {
+                            Type = JobType.ClearDebris,
+                            JobKey = GetJobKey(farm, JobType.ClearDebris, tile),
+                            TargetName = harvestName,
+                            TargetTile = tile,
+                            AdjacentTile = adjacentTiles.First(), // improve later
+                            BasePriority = 100,
+                        });
+                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {harvestName} \"ClearDebris\"", LogLevel.Trace);
                         continue;                     
-                    }  
-                    TimeSpan timestamp = new TimeSpan(DateTime.Now.Ticks);
-                    if (TryBuildMachineJob(farm, tile, timestamp,  out BotJob machineJob)) {
-                        jobs.Add(machineJob);
-                        continue;
                     }
-                    if (IsClearableTile(farm, tile, out string harvestName))
-                    jobs.Add(new BotJob
+                    //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} checking Tillable", LogLevel.Trace);                   
+                    if (TryBuildTillSoilJob(farm, tile, out BotJob tillSoilJob))
                     {
-                        Type = JobType.ClearDebris,
-                        JobKey = GetJobKey(farm, JobType.ClearDebris, tile),
-                        TargetName = harvestName,
-                        TargetTile = tile,
-                        AdjacentTile = adjacentTiles.First(), // improve later
-                        BasePriority = 100,
-                    });
+                        jobs.Add(tillSoilJob);
+                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {tillSoilJob.TargetName} \"TillSoil\"", LogLevel.Trace);
+                        continue;                     
+                    };      
 
                 }
             }
@@ -512,6 +665,13 @@ namespace Farmtronics {
         {
             string locationName = location?.NameOrUniqueName ?? "";
             return $"{locationName}:{type}:{(int)tile.X},{(int)tile.Y}";
+        }
+        private bool IsPlanStillValid(GameLocation location, PendingPlan plan)
+        {
+            if (plan.JobType == JobType.TillSoil)
+                return IsStillTillable(location, plan.TargetTile);
+
+            return true;
         }
         private void TryCreatePlanForBot(BotSupervisorState state, TimeSpan now)
         {
@@ -527,23 +687,11 @@ namespace Farmtronics {
 
             var allJobs = BuildJobsForLocation(bot.currentLocation, state).ToList();
 
-            ModEntry.instance.Monitor.Log(
-                $"Supervisor: built {allJobs.Count} jobs for {bot.name}",
-                LogLevel.Trace);
-
-
-            foreach (var job in allJobs)
-            {
-                ModEntry.instance.Monitor.Log(
-                    $"Candidate built: {job.GetType().Name} target={job.TargetTile.X},{job.TargetTile.Y} " +
-                    $"name={job.TargetName}",
-                    LogLevel.Trace);
-            }
-
             var jobs = new List<BotJob>();
 
             foreach (var job in allJobs)
             {
+                TryGetAllowedMachinesForBot(bot.name, out var allowedMachines);
                 var score = ScoreJobForBot(state, job);
 
                 if (IsTargetIgnored(location, job.TargetTile))
@@ -570,10 +718,10 @@ namespace Farmtronics {
                     continue;
                 }
 
-                ModEntry.instance.Monitor.Log(
+                /*ModEntry.instance.Monitor.Log(
                     $"Accepted job: {job.GetType().Name} target={job.TargetTile.X},{job.TargetTile.Y} " +
                     $"name={job.TargetName} score={score}",
-                    LogLevel.Trace);
+                    LogLevel.Trace);*/
 
                 jobs.Add(job);
             }
@@ -586,11 +734,16 @@ namespace Farmtronics {
 			foreach (var job in jobs)
             {
                 ModEntry.instance.Monitor.Log(
-                    $"job name {job.Type}: target tile {job.TargetTile.X},{job.TargetTile.Y} name {job.TargetName}");
+                    $"job name {job.Type}: target tile {job.TargetTile.X},{job.TargetTile.Y} name: {job.TargetName}");
 
                 var path = FindPath(location, bot.TileLocation, job.AdjacentTile);
                 if (path == null)
                 {
+                    ModEntry.instance.Monitor.Log(
+                        $"No path for {bot.name}: {job.Type} target {job.TargetTile.X},{job.TargetTile.Y} " +
+                        $"adjacent {job.AdjacentTile.X},{job.AdjacentTile.Y} from {bot.TileLocation.X},{bot.TileLocation.Y}",
+                        LogLevel.Trace);
+
                     BlockTarget(location, job.TargetTile, now);
                     continue;
                 }
@@ -603,6 +756,11 @@ namespace Farmtronics {
 
                 if (string.IsNullOrWhiteSpace(script))
                 {
+                    ModEntry.instance.Monitor.Log(
+                        $"No script for {bot.name}: {job.Type} target {job.TargetTile.X},{job.TargetTile.Y} " +
+                        $"adjacent {job.AdjacentTile.X},{job.AdjacentTile.Y}",
+                        LogLevel.Trace);
+
                     BlockTarget(location, job.TargetTile, now);
                     continue;
                 }
@@ -614,6 +772,7 @@ namespace Farmtronics {
                     JobType = job.Type,
                     JobKey = job.JobKey,
                     TargetTile = job.TargetTile,
+                    StandTile = job.AdjacentTile,
                     TargetName = job.TargetName,
                     StartTile = bot.TileLocation,
                     Script = script,
@@ -642,10 +801,10 @@ namespace Farmtronics {
                 ? "MACHINE JOB REJECTED"
                 : "Rejected job";
 
-            ModEntry.instance.Monitor.Log(
+            /*ModEntry.instance.Monitor.Log(
                 $"{prefix}: {job.GetType().Name} target={job.TargetTile.X},{job.TargetTile.Y} " +
                 $"name={job.TargetName} score={score} reason={reason}",
-                LogLevel.Trace);
+                LogLevel.Trace);*/
         }
         private bool BotHasInventoryCategory(BotObject bot, int category)
         {
@@ -664,6 +823,9 @@ namespace Farmtronics {
         {
             return job.Type switch
             {
+                JobType.TillSoil =>
+                    BotHasToolType(state.Bot, "Hoe"),
+
                 JobType.PlantCrop =>
                     BotHasInventoryCategory(state.Bot, "Seed"),
 
@@ -671,17 +833,40 @@ namespace Farmtronics {
                     BotHasToolType(state.Bot, "WateringCan"),
 
                 JobType.ServiceMachine =>
-                    BotHasMachineInput(state.Bot, job),
+                    BotCanServiceMachine(state, job),
 
-                JobType.MineBreakStone =>
+                JobType.MineBreakStone =>   
                     BotHasToolType(state.Bot, "Pickaxe"),
 
                 _ => true,
             };
         }
+        private bool BotCanServiceMachine(BotSupervisorState state, BotJob job)
+        {
+            var botName = state.Bot?.name ?? "";
 
+            // No machine role? Then this is a farm/general bot.
+            // It should not do machine jobs.
+            if (!TryGetAllowedMachinesForBot(botName, out var allowedMachines))
+                return false;
+
+            // Has a machine role, but not for this machine.
+            if (!allowedMachines.Contains(job.TargetName))
+                return false;
+
+            // Has the role and the needed input.
+            return BotHasMachineInput(state.Bot, job);
+        }
         private bool BotHasMachineInput(BotObject bot, BotJob job)
         {
+            var botName = bot.name ?? "";
+
+            if (TryGetAllowedMachinesForBot(botName, out var allowedMachines))
+            {
+                // Machine-limited bot can only service allowed machine names.
+                if (!allowedMachines.Contains(job.TargetName))
+                    return false;
+            }
             if (job.InputRules == null || job.InputRules.Count == 0)
                 return true;
 
@@ -695,9 +880,9 @@ namespace Farmtronics {
                     BotHasInventoryCategory(bot, input.Category))
                     return true;
             }
-
             return false;
         }
+
         private bool BotHasInventoryName(BotObject bot, string name)
         {
             if (bot?.farmer == null)
@@ -776,13 +961,6 @@ namespace Farmtronics {
 
 			string typeName = info.GetString("type");
 			string objectName = info.GetString("name");
-            //string growthStage = info.GetString("growthStage");
-            //string stump = info.GetString("stump");
-            //string tapped = info.GetString("tapped");
-
-            //if(typeName=="Tree" && (growthStage == null || int.Parse(growthStage) < 6 || stump == "1" || tapped == "1")) {
-            //    return false;
-            //}
 			string match = clearTypes.FirstOrDefault(name => name == typeName || name == objectName);
 			if (match == null) return false;
 
@@ -830,9 +1008,32 @@ namespace Farmtronics {
             public string Name { get; init; }
             public string EndsWith { get; init; }
         }
+        private static readonly Dictionary<string, string> BotMachinePrefixes = new()
+        {
+            ["keg"] = "Keg",
+            ["jar"] = "Preserves Jar",
+            ["preserves"] = "Preserves Jar",
+            ["seed"] = "Seed Maker",
+            ["mayo"] = "Mayonnaise Machine",
+            ["mayonnaise"] = "Mayonnaise Machine",
+            ["cheese"] = "Cheese Press",
+            ["furnace"] = "Furnace",
+            ["kiln"] = "Charcoal Kiln"
+        };
 
         private static readonly List<MachineRule> machineRules = new()
         {
+            new()
+            {
+                MachineName = "Cheese Press",
+                BasePriority = 750,
+                InputRules =
+                {
+                    new MachineInputRule { Category = "Milk" },
+                    new MachineInputRule { Name = "Milk" },
+                    new MachineInputRule { Name = "Goat Milk" },
+                }
+            },
             new()
             {
                 MachineName = "Keg",
@@ -873,6 +1074,7 @@ namespace Farmtronics {
                 InputRules =
                 {
                     new MachineInputRule { Category = "Vegetable" },
+                    new MachineInputRule { Category = "Fruit" },
                 }
             },
             new()
@@ -890,13 +1092,13 @@ namespace Farmtronics {
                 BasePriority = 650,
                 InputRules =
                 {
-                    new MachineInputRule { Category = "Egg" },
-                    new MachineInputRule { Category = "Large Egg" },
-                    new MachineInputRule { Category = "Duck Egg" },
-                    new MachineInputRule { Category = "Void Egg" },
-                    new MachineInputRule { Category = "Dinosaur Egg" },
-                    new MachineInputRule { Category = "Ostrich Egg" },
-                    new MachineInputRule { Category = "Golden Egg" },
+                    new MachineInputRule { Name = "Egg" },
+                    new MachineInputRule { Name = "Large Egg" },
+                    new MachineInputRule { Name = "Duck Egg" },
+                    new MachineInputRule { Name = "Void Egg" },
+                    new MachineInputRule { Name = "Dinosaur Egg" },
+                    new MachineInputRule { Name = "Ostrich Egg" },
+                    new MachineInputRule { Name = "Golden Egg" },
                 }
             },
         };
@@ -944,6 +1146,49 @@ namespace Farmtronics {
                 && obj.MinutesUntilReady > 0
                 && !obj.readyForHarvest.Value;
         }
+        private bool TryBuildTillSoilJob(Farm farm, Vector2 tile, out BotJob job)
+        {
+            job = null;
+
+            if (farm.objects.TryGetValue(tile, out StardewValley.Object obj))
+                return false;
+
+            // Already has terrain feature.
+            if (farm.terrainFeatures.TryGetValue(tile, out var feature))
+            {
+                // HoeDirt means already tilled.
+                if (feature is StardewValley.TerrainFeatures.HoeDirt)
+                    return false;
+
+                // Anything else means blocked for now: tree, grass, etc.
+                return false;
+            }
+
+            var diggable = farm.doesTileHaveProperty((int)tile.X, (int)tile.Y, "Diggable", "Back");
+
+            if (diggable == null)
+                return false;
+
+            var adjacentTiles = GetAdjacentPassableTiles(farm, tile).ToList();
+            if (adjacentTiles.Count == 0)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"Tilling job rejected: no adjacent passable tile from {(int)tile.X},{(int)tile.Y}");
+                return false;
+            }
+
+            job = new BotJob
+            {
+                Type = JobType.TillSoil,
+                JobKey = GetJobKey(farm, JobType.TillSoil, tile),
+                TargetName = "Empty for Tilling",
+                TargetTile = tile,
+                AdjacentTile = adjacentTiles.First(),
+                BasePriority = 1,
+            };
+
+            return true;
+        }
         private bool TryBuildMachineJob(Farm farm, Vector2 tile, TimeSpan now, out BotJob job)
         {
             job = null;
@@ -961,11 +1206,11 @@ namespace Farmtronics {
             // 2. Skip machines that are clearly busy/running.
             if (IsBusyMachine(obj))
             {
-                ModEntry.instance.Monitor.Log(
+                /*ModEntry.instance.Monitor.Log(
                     $"Machine busy, skipping: {obj.Name} at {tile.X},{tile.Y}, " +
                     $"held={obj.heldObject.Value?.Name ?? "null"}, " +
                     $"minutes={obj.MinutesUntilReady}, ready={obj.readyForHarvest.Value}",
-                    LogLevel.Trace);
+                    LogLevel.Trace);*/
 
                 return false;
             }
@@ -1042,8 +1287,6 @@ namespace Farmtronics {
 
             var adjacentTile = adjacentTiles.First();
 
-            
-
             job = new BotJob
             {
                 Type = JobType.ServiceMachine,
@@ -1056,6 +1299,18 @@ namespace Farmtronics {
             };
 
             return true;
+        }
+        private bool TryGetClearAllJob(
+            GameLocation location,
+            Vector2 tile,
+            out string targetName)
+        {
+            targetName = null;
+            if (IsClearableTile(location, tile, out string resourceName)) {
+                targetName = resourceName;
+                return true;
+            }
+            return false;
         }
         private bool TryGetMineJob(
             MineShaft mine,
@@ -1177,7 +1432,8 @@ namespace Farmtronics {
                 
             return plan.JobType switch
             {
-                JobType.ClearDebris => IsClearableTile(bot.currentLocation, plan.TargetTile),
+                JobType.TillSoil => IsStillTillable(bot.currentLocation, plan.TargetTile),
+                JobType.ClearDebris => IsClearableTile(bot.currentLocation, plan.TargetTile, out _),
                 JobType.WaterCrop => IsDryCropTile(bot.currentLocation, plan.TargetTile),
                 JobType.HarvestCrop => IsHarvestableCropTile(bot.currentLocation, plan.TargetTile, out _, out _),
                 JobType.PlantCrop => IsPlantCropTile(bot.currentLocation, plan.TargetTile, out _, out _, out  _),
@@ -1235,13 +1491,31 @@ namespace Farmtronics {
         }
         static int ScoreJobForBot(BotSupervisorState state, BotJob job)
         {
-            int distance = ManhattanDistance(state.Bot.TileLocation, job.AdjacentTile);
-            return job.BasePriority - distance * 10;
-        }
-		private bool IsClearableTile(GameLocation location, Vector2 tile) {
-			return IsClearableTile(location, tile, out _);
-		}
+            double score = job.BasePriority;
 
+            int distance = ManhattanDistance(state.Bot.TileLocation, job.AdjacentTile);
+            return (int)(score - distance * 10);
+        }
+        private bool IsStillTillable(GameLocation location, Vector2 tile)
+        {
+            if (location.objects.ContainsKey(tile))
+                return false;
+
+            if (location.terrainFeatures.TryGetValue(tile, out var feature))
+                return false; // includes HoeDirt, grass, trees, etc.
+
+            var diggable = location.doesTileHaveProperty(
+                (int)tile.X,
+                (int)tile.Y,
+                "Diggable",
+                "Back");
+
+                    ModEntry.instance.Monitor.Log(
+                    $"Return from 1454 doesTileHaveProperty: _{diggable}_ at {tile.X},{tile.Y}",
+                    LogLevel.Trace);
+
+            return diggable == "T";
+        }
 		private IEnumerable<Vector2> GetAdjacentPassableTiles(GameLocation location, Vector2 tile) {
 			var candidates = new[] {
 				tile + new Vector2(0, -1),
@@ -1328,7 +1602,27 @@ namespace Farmtronics {
         }
         private static void AddScriptHelpers(List<string> lines)
         {
-            AddLines(lines,
+                AddLines(lines,
+                "    faceNorth = function()",
+                "        while not me.facing == north",
+                "            me.right",
+                "       end while",
+                "    end function",
+                "    faceEast = function()",
+                "        while not me.facing == east",
+                "           me.right",
+                "        end while",
+                "    end function",
+                "    faceSouth = function()",
+                "       while not me.facing == south",
+                "            me.right",
+                "       end while",
+                "    end function",
+                "    faceWest = function()",
+                "        while not me.facing == west",
+                "            me.right",
+                "        end while",
+                "    end function",
                 "    selectInventoryByName = function(name=\"Fertilizer\")",
                 "        for i in range(0,11)",
                 "            item = me.inventory[i]",
@@ -1345,6 +1639,7 @@ namespace Farmtronics {
                 "            item = me.inventory[i]",
                 "            if item and item.hasIndex(\"category\") and item.category == cat then",
                 "                me.select i",
+                "                if item.hasIndex(\"name\") then return item.name",
                 "                return true",
                 "            end if",
                 "        end for",
@@ -1360,6 +1655,7 @@ namespace Farmtronics {
                 "            item = me.inventory[i]",
                 "            if item and item.hasIndex(\"type\") and item.type == type then",
                 "                me.select i",
+                "                if item.hasIndex(\"name\") then return item.name",
                 "                return true",
                 "            end if",
                 "        end for",
@@ -1430,9 +1726,19 @@ private static void AddPlantCropAction(List<string> lines, BotJob job)
 {
     AddLines(lines,
         "    print \"Planting crop\"",
-        "    if not selectInventoryByCategory(\"Seed\") then",
+        "    if selectInventoryByCategory(\"Fertilizer\") then me.placeItem",
+        "    seedName = selectInventoryByCategory(\"Seed\")",
+        "    trellised = [\"Hops Starter\",\"Grape Starter\",\"Bean Starter\"]",
+        "    if not seedName then",
         "        print \"No seeds\"",
         "        return false",
+        "    end if",
+        "    if(trellised.hasIndex(seedName)) then",
+        "       if me.position.x%2==1 and me.position.y%2==1 then",
+        "           faceNorth",
+        "           me.placeItem",
+        "           faceSouth",   
+        "       end if",
         "    end if",
         "    me.placeItem",
         "    wait 0",
@@ -1440,6 +1746,89 @@ private static void AddPlantCropAction(List<string> lines, BotJob job)
     );
 }
 
+private static readonly Dictionary<string, HashSet<string>> BotMachineRoles =
+    new(StringComparer.OrdinalIgnoreCase)
+{
+    ["keg"] = new()
+    {
+        "Keg"
+    },
+
+    ["wine"] = new()
+    {
+        "Keg"
+    },
+
+    ["jar"] = new()
+    {
+        "Preserves Jar"
+    },
+
+    ["preserves"] = new()
+    {
+        "Preserves Jar"
+    },
+
+    ["seed"] = new()
+    {
+        "Seed Maker"
+    },
+
+    ["forge"] = new()
+    {
+        "Furnace",
+        "Charcoal Kiln"
+    },
+
+    ["animal"] = new()
+    {
+        "Mayonnaise Machine",
+        "Cheese Press"
+    },
+
+    ["mayo"] = new()
+    {
+        "Mayonnaise Machine"
+    },
+
+    ["cheese"] = new()
+    {
+        "Cheese Press"
+    },
+
+    ["kiln"] = new()
+    {
+        "Charcoal Kiln"
+    },
+
+    ["furnace"] = new()
+    {
+        "Furnace"
+    }
+};
+
+private static bool TryGetAllowedMachinesForBot(
+    string botName,
+    out HashSet<string> allowedMachines)
+{
+    allowedMachines = null;
+
+    if (string.IsNullOrWhiteSpace(botName))
+        return false;
+
+    var normalized = botName.Trim().ToLowerInvariant();
+
+    foreach (var pair in BotMachineRoles.OrderByDescending(p => p.Key.Length))
+    {
+        if (normalized.StartsWith(pair.Key, StringComparison.OrdinalIgnoreCase))
+        {
+            allowedMachines = pair.Value;
+            return true;
+        }
+    }
+
+    return false;
+}
 private static void AddServiceMachineAction(List<string> lines, BotJob job)
 {
     lines.Add($"    print \"Servicing machine: {job.TargetName}\"");
@@ -1488,6 +1877,20 @@ private static string EscapeMiniScript(string text)
 {
     return (text ?? "").Replace("\"", "\"\"");
 }
+
+private static void AddTillSoilAction(List<string> lines, BotJob job)
+{
+    AddLines(lines,
+        "    print \"Tilling soil\"",
+        "    if not selectInventoryByType(\"Hoe\") then",
+        "        print \"No hoe\"",
+        "        return false",
+        "    end if",
+        "    me.useTool",
+        "    wait 0",
+        "    return true"
+    );
+}
 private static void AddMineBreakStoneAction(List<string> lines)
 {
     AddLines(lines,
@@ -1502,6 +1905,19 @@ private static void AddMineCutWeedsAction(List<string> lines)
     AddLines(lines,
         "    print \"Cutting mine weeds\"",
         "    me.clearAhead",
+        "    wait 0",
+        "    return true"
+    );
+}
+private static void AddMineDigFloorAction(List<string> lines)
+{
+    AddLines(lines,
+        "    print \"Diggin mine floor\"",
+        "    if not selectInventoryByType(\"Hoe\") then",
+        "        print \"No hoe\"",
+        "        return false",
+        "    end if",
+        "    me.useTool",
         "    wait 0",
         "    return true"
     );
@@ -1538,11 +1954,12 @@ private static void AddScriptFooter(List<string> lines)
                 case JobType.ServiceMachine:
                     AddServiceMachineAction(lines, job);
                     break;
-
+                case JobType.TillSoil:
+                    AddTillSoilAction(lines, job);
+                    break;
                 case JobType.MineBreakStone:
                     AddMineBreakStoneAction(lines);
                     break;
-
                 case JobType.MineCutWeeds:
                     AddMineCutWeedsAction(lines);
                     break;
@@ -1640,11 +2057,43 @@ private static void AddScriptFooter(List<string> lines)
         {
             var player = Game1.player;
             var loc = player.currentLocation;
-            var pos = player.position;
 
-            string msg = $"Farmer: {loc?.NameOrUniqueName ?? "(null)"} tile {(int)(pos.X / 64)},{(int)(pos.Y / 64)}";
+            if (player == null || loc == null)
+                return;
+
+            var pos = player.position;
+            var x = (int)(pos.X / 64);
+            var y = (int)(pos.Y / 64);
+
+            var farmerTile = new Vector2(x, y);
+            var aheadTile = GetTileAhead(farmerTile, player.FacingDirection);
+
+            ValMap aheadInfo = TileInfo.GetInfo(loc, aheadTile);
+
+            string msg =
+                $"Farmer: {loc.NameOrUniqueName} tile {x},{y} " +
+                $"facing {player.FacingDirection}; " +
+                $"ahead {aheadTile.X},{aheadTile.Y}";
+
+            string aheadMsg =
+                $"Ahead info: {aheadInfo}";
+
             ModEntry.instance.Monitor.Log(msg);
+            ModEntry.instance.Monitor.Log(aheadMsg);
+
             Game1.addHUDMessage(new HUDMessage(msg, HUDMessage.newQuest_type));
+            Game1.addHUDMessage(new HUDMessage(aheadMsg, HUDMessage.newQuest_type));
+        }
+        private static Vector2 GetTileAhead(Vector2 tile, int facingDirection)
+        {
+            return facingDirection switch
+            {
+                0 => tile + new Vector2(0, -1), // up
+                1 => tile + new Vector2(1, 0),  // right
+                2 => tile + new Vector2(0, 1),  // down
+                3 => tile + new Vector2(-1, 0), // left
+                _ => tile
+            };
         }
         public void ReportAllBots()
         {
@@ -1659,7 +2108,32 @@ private static void AddScriptFooter(List<string> lines)
                     ModEntry.instance.Monitor.Log("Bot report: null bot");
                     continue;
                 }
+                if (bot.farmer == null)
+                {
+                    ModEntry.instance.Monitor.Log("Bot report: null bot farmer");
+                    continue;
+                }
+                bool hasAnyTool =
+                bot.inventory.Any(item =>
+                    item is Tool);
+                if (!hasAnyTool)
+                {
+                    ModEntry.instance.Monitor.Log("Bot report: bot has no tools, giving tools");
+                    bot.farmer.Items.AddRange(Farmer.initialTools());
 
+                    // Inventory indices have to exist, since InventoryMenu exclusively uses them and can't assign items otherwise.
+                    for (int i = bot.farmer.Items.Count; i < bot.GetActualCapacity(); i++) {
+                        bot.farmer.Items.Add(null);
+                    }
+                }
+                hasAnyTool =
+                bot.inventory.Any(item =>
+                    item is Tool);
+                if (!hasAnyTool)
+                {
+                    ModEntry.instance.Monitor.Log("Bot report: bot has no tools, giving tools didn't work");
+                    continue;
+                }
                 string locName = bot.currentLocation?.NameOrUniqueName ?? "(null)";
                 var tile = bot.TileLocation;
 
@@ -1677,7 +2151,7 @@ private static void AddScriptFooter(List<string> lines)
             }
         }
 
-        public void WarpAllBotsToPlayer()
+        public void WarpSameLocationBotsToPlayer()
         {
             var player = Game1.player;
             var loc = player.currentLocation;
@@ -1688,18 +2162,30 @@ private static void AddScriptFooter(List<string> lines)
             foreach (var bot in BotManager.GetAllBots())
             {
                 if (bot == null) continue;
-
+                if (bot.currentLocation != loc) continue;
+                bool inBotStates = false;
+                foreach(var bss in botStates.Values) {
+                  if (bss.Bot == bot) {
+                    inBotStates = true;
+                    break;
+                  }
+                }
                 var targetPos = pos + new Vector2(offset * 64, 0);
                 offset++;
-
-                // PSEUDO: use whatever Farmtronics/BotObject supports.
-                // If BotObject wraps a hidden Farmer, warp that farmer.
+                Vector2 targetTile;
+                targetTile.X = (int)targetPos.X/64;
+                targetTile.Y = (int)targetPos.Y/64;
+                if (inBotStates) {
+                    botStates[bot.name].Mode = BotMode.Planning;
+                    botStates[bot.name].CurrentPlan = null;                   
+                }
                 bot.currentLocation = loc;
-                bot.Position = targetPos; // only if Position is available/settable
-
+                bot.Position = targetPos; 
+                bot.TileLocation = targetTile;
                 ModEntry.instance.Monitor.Log(
-                    $"Warped {bot.name} to {loc.NameOrUniqueName} tile {(int)targetPos.X},{(int)targetPos.Y}");
+                    $"Warped {bot.name} to {loc.NameOrUniqueName} tile {targetTile.X},{targetTile.Y}");
             }
+            StartAllBots();
         }
         public void WarpPlayerHome()
         {
@@ -1757,10 +2243,28 @@ private static void AddScriptFooter(List<string> lines)
             if (!IsWithinMap(location, tile)) return false;
 
             ValMap info = TileInfo.GetInfo(location, tile);
-            if (info == null) return true;
+            try
+            {
+                if (info == null)
+                {
+                    //ModEntry.instance.Monitor.Log(
+                        //$"Tile info missing for {location.NameOrUniqueName} at {tile.X},{tile.Y}",
+                        //LogLevel.Warn);
+                    return true;
+                }
+            }
+            catch (Exception ex)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"Error getting tile info for {location.NameOrUniqueName} at {tile.X},{tile.Y}: {ex}",
+                    LogLevel.Error);
+                return true;
+            }
 
             string typeName = info.GetString("type");
             string objectName = info.GetString("name");
+
+            if (typeName == null && objectName == null) return true;
 
             // SMAPI/Farmtronics may report Building passable,
             // but bots cannot path through structures.

@@ -138,8 +138,8 @@ namespace Farmtronics
 				supervisor.ReportAllBots();
 				break;
 			case SButton.F7:
-				Monitor.Log("F7 pressed: Warp All Bots to Me.");
-				supervisor.WarpAllBotsToPlayer();
+				Monitor.Log("F7 pressed: Warp Local Bots to Me.");
+				supervisor.WarpSameLocationBotsToPlayer();
 				break;
 			case SButton.F8 when !e.IsDown(SButton.LeftShift):
 				Monitor.Log("F8 pressed: Warp Myself Home.");
@@ -151,7 +151,7 @@ namespace Farmtronics
 				break;
 			case SButton.F9:
 				Monitor.Log("F9 pressed: starting all bots.");
-				supervisor.StartAllBotsRockTest();
+				supervisor.StartAllBots();
 				break;		
 			case SButton.F10:
 				ToDoManager.MarkAllTasksDone();
