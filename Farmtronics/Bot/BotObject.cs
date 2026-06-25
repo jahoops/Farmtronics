@@ -58,6 +58,45 @@ namespace Farmtronics.Bot {
 		private Vector2 targetPos;  // position we're moving to, in pixels
 		private int scytheUseFrame = 0;       // > 0 when using the scythe
 		private float scytheOldStamina = -1;
+		public string BotGuid
+		{
+			get
+			{
+				if (!modData.TryGetValue(ModEntry.GetModDataKey("botGuid"), out string guid) || string.IsNullOrWhiteSpace(guid))
+				{
+					guid = Guid.NewGuid().ToString("N");
+					modData[ModEntry.GetModDataKey("botGuid")] = guid;
+				}
+				return guid;
+			}
+			set => modData[ModEntry.GetModDataKey("botGuid")] = string.IsNullOrWhiteSpace(value) ? Guid.NewGuid().ToString("N") : value;
+		}
+
+		public long CreatedTick
+		{
+			get
+			{
+				if (!modData.TryGetValue(ModEntry.GetModDataKey("createdTick"), out string raw) || !long.TryParse(raw, out long result) || result <= 0)
+				{
+					result = (long)(Game1.stats?.DaysPlayed ?? 0) * 1000000L + Game1.ticks;
+					modData[ModEntry.GetModDataKey("createdTick")] = result.ToString();
+				}
+				return result;
+			}
+			set => modData[ModEntry.GetModDataKey("createdTick")] = value.ToString();
+		}
+
+		public string CreatedFrom
+		{
+			get => modData.TryGetValue(ModEntry.GetModDataKey("createdFrom"), out string value) ? value : "";
+			set => modData[ModEntry.GetModDataKey("createdFrom")] = value ?? "";
+		}
+
+		public bool IsQuarantined
+		{
+			get => modData.TryGetValue(ModEntry.GetModDataKey("isQuarantined"), out string value) && value == "1";
+			set => modData[ModEntry.GetModDataKey("isQuarantined")] = value ? "1" : "0";
+		}
 
 		// Assign common values
 		private void Initialize() {
@@ -68,6 +107,18 @@ namespace Farmtronics.Bot {
 			ItemId = internalID_c;
 			bigCraftable.Value = true;
 			CanBeSetDown = true;
+			CanBeGrabbed = false;
+			_ = BotGuid;
+			_ = CreatedTick;
+		}
+
+		public void ResetIdentity(string createdFrom)
+		{
+			BotGuid = Guid.NewGuid().ToString("N");
+			CreatedTick = (long)(Game1.stats?.DaysPlayed ?? 0) * 1000000L + Game1.ticks;
+			CreatedFrom = createdFrom;
+			IsQuarantined = false;
+			data?.Update();
 		}
 
 		private void CreateFarmer(Vector2 tileLocation, GameLocation location) {
@@ -140,8 +191,16 @@ namespace Farmtronics.Bot {
 		/// to create a new Bot instance that matches its data.
 		/// </summary>
 		public override bool placementAction(GameLocation location, int x, int y, Farmer who = null) {
-			ModEntry.instance.Monitor.Log($"Bot.placementAction({location}, {x}, {y}, {who.Name})");
+			ModEntry.instance.Monitor.Log($"Bot.placementAction({location}, {x}, {y}, {who?.Name ?? "(null)"})");
 			Vector2 placementTile = new Vector2(x, y).GetTilePosition();
+			if (location.objects.TryGetValue(placementTile, out StardewValley.Object occupyingObject))
+			{
+				ModEntry.instance.Monitor.Log(
+					$"Refused bot placement at {location.NameOrUniqueName} {placementTile.X},{placementTile.Y}; occupied by {occupyingObject.Name}.",
+					LogLevel.Warn);
+				return false;
+			}
+
 			// Create a new bot.
 			var bot = new BotObject(placementTile, location);
 			location.setObject(placementTile, bot);
@@ -152,16 +211,16 @@ namespace Farmtronics.Bot {
 			// ModEntry.instance.Monitor.Log($"Placement: {bot.data.ToString()}");
 
 			// But have the placed bot face the same direction as the farmer placing it.
-			bot.farmer.FacingDirection = who.facingDirection.Value;
+			bot.farmer.FacingDirection = who?.facingDirection.Value ?? 2;
 			// Make sure the bot is owned by the farmer placing it.
-			bot.owner.Value = who.UniqueMultiplayerID;
+			bot.owner.Value = who?.UniqueMultiplayerID ?? Game1.player.UniqueMultiplayerID;
 			
 			// Save new facingDirection
 			bot.data.Update();
 			// ModEntry.instance.Monitor.Log($"Placement new: {bot.data.ToString()}");
 
 			// Add the new bot (which is in the world) to our instances list.
-			BotManager.instances.Add(bot);
+			BotManager.RegisterLocalBot(bot, "placement");
 			//ModEntry.instance.Monitor.Log($"Added {bot.Name} to instances; now have {instances.Count}");
 
 			location.playSound("hammer");
@@ -197,9 +256,29 @@ namespace Farmtronics.Bot {
 			
 			if (farmer == null || inventory == null || farmer.CurrentTool == null) return;
 			Vector2 toolLocation = farmer.GetToolLocation(true);
+			Vector2 toolTile = toolLocation.GetTilePosition();
 			#if DEBUG
 			ModEntry.instance.Monitor.Log($"UseTool called: {farmer.CurrentTool.Name}[{farmer.CurrentToolIndex}] {toolLocation}", LogLevel.Trace);
 			#endif
+
+			if (currentLocation != null && currentLocation.objects.TryGetValue(toolTile, out StardewValley.Object targetObject))
+			{
+				if (targetObject is BotObject)
+				{
+					ModEntry.instance.Monitor.Log(
+						$"{name} refused to use {farmer.CurrentTool.Name} on bot at {currentLocation.NameOrUniqueName} {toolTile.X},{toolTile.Y}.",
+						LogLevel.Warn);
+					return;
+				}
+
+				if (targetObject is Chest || targetObject.bigCraftable.Value || targetObject.Type == "Crafting")
+				{
+					ModEntry.instance.Monitor.Log(
+						$"{name} refused to use {farmer.CurrentTool.Name} on placed object {targetObject.Name} at {currentLocation.NameOrUniqueName} {toolTile.X},{toolTile.Y}.",
+						LogLevel.Warn);
+					return;
+				}
+			}
 
 			// Check ResourceClumps and current UpgradeLevel before hitting them
 			var clump = currentLocation.GetCollidingResourceClump(toolLocation);
@@ -577,6 +656,14 @@ namespace Farmtronics.Bot {
 			return (Position != targetPos);
 		}
 
+		public void CancelCurrentAction() {
+			targetPos = Position;
+			scytheUseFrame = 0;
+			scytheOldStamina = -1;
+			if (farmer != null)
+				farmer.UsingTool = false;
+		}
+
 		public void Rotate(int stepsClockwise) {
 			farmer.faceDirection((farmer.FacingDirection + 4 + stepsClockwise) % 4);
 			data.Update();
@@ -620,6 +707,15 @@ namespace Farmtronics.Bot {
 			// Finally, apply to any object sitting on this tile.
 			if (location.Objects.ContainsKey(tile)) {
 				var obj = location.Objects[tile];
+				if (obj is BotObject || obj is Chest || obj.bigCraftable.Value || obj.Type == "Crafting") {
+					ModEntry.instance.Monitor.Log(
+						$"{name} refused scythe/tool removal on protected object {obj.Name} at {location.NameOrUniqueName} {tile.X},{tile.Y}.",
+						LogLevel.Warn);
+					farmer.checkForExhaustion(scytheOldStamina);
+					data.Update();
+					scytheOldStamina = -1;
+					return;
+				}
 				if (obj != null && obj.Type != null && obj.performToolAction(tool)) {
 					if (obj.Type.Equals("Crafting") && (int)obj.Fragility != 2) {
 						var center = farmer.GetBoundingBox().Center;
@@ -685,11 +781,32 @@ namespace Farmtronics.Bot {
 				}
 				data.Update();
 				if (TileLocation != farmer.Tile) {
-					// Remove this object from the Objects list at its old position
-					currentLocation.removeObject(TileLocation, false);
-					// Update our tile pos, and add this object to the Objects list at the new position
-					TileLocation = farmer.Tile;
-					currentLocation.setObject(TileLocation, this);
+					Vector2 oldTile = TileLocation;
+					Vector2 newTile = farmer.Tile;
+					if (currentLocation.objects.TryGetValue(newTile, out StardewValley.Object occupyingObject)
+						&& !ReferenceEquals(occupyingObject, this))
+					{
+						ModEntry.instance.Monitor.Log(
+							$"{name} movement blocked to avoid overwriting {occupyingObject.Name} at {currentLocation.NameOrUniqueName} {newTile.X},{newTile.Y}.",
+							LogLevel.Warn);
+						farmer.Position = targetPos = oldTile.GetAbsolutePosition();
+					}
+					else
+					{
+						Vector2? oldKey = null;
+						foreach (var pair in currentLocation.objects.Pairs)
+						{
+							if (ReferenceEquals(pair.Value, this))
+							{
+								oldKey = pair.Key;
+								break;
+							}
+						}
+						if (oldKey.HasValue && oldKey.Value != newTile)
+							currentLocation.objects.Remove(oldKey.Value);
+						TileLocation = newTile;
+						currentLocation.objects[newTile] = this;
+					}
 				}
 				//ModEntry.instance.Monitor.Log($"Updated position to {farmer.Position}, tileLocation to {TileLocation}; facing {farmer.FacingDirection}");
 			}
@@ -772,7 +889,21 @@ namespace Farmtronics.Bot {
 
 		public override bool performToolAction(Tool t) {
 			ModEntry.instance.Monitor.Log($"{name} Bot.performToolAction({t}, {Location})");
+			if (t == null) {
+				ModEntry.instance.Monitor.Log(
+					$"{name} ignored null tool action at {Location?.NameOrUniqueName ?? "(null)"} {TileLocation.X},{TileLocation.Y}; bots are persistent and cannot be removed by tools.",
+					LogLevel.Trace);
+				return false;
+			}
+
 			var who = t.getLastFarmerToUse();
+			if (who == null) {
+				ModEntry.instance.Monitor.Log(
+					$"{name} ignored {t.Name} tool action with no farmer at {Location?.NameOrUniqueName ?? "(null)"} {TileLocation.X},{TileLocation.Y}; bots are persistent and cannot be removed by tools.",
+					LogLevel.Trace);
+				return false;
+			}
+
 			if (who.UniqueMultiplayerID != owner.Value) {
 				shakeTimer = 20;
 				Game1.playSound("hammer");
@@ -785,15 +916,9 @@ namespace Farmtronics.Bot {
 			// NOTE: If a player holds left click it will eventually trigger a toolAction with a pickaxe
 			// 		 This could be checked like this: t != t.getLastFarmerToUse().CurrentTool
 			if (t is Pickaxe or Axe or Hoe) {
-				
-				//ModEntry.instance.Monitor.Log("{name} Bot.performToolAction: creating custom debris");
-				Debris deb = new Debris(GetOneNew(), who.GetToolLocation(true), new Vector2(who.GetBoundingBox().Center.X, who.GetBoundingBox().Center.Y));
-				Location.debris.Add(deb);
-				ModEntry.instance.Monitor.Log($"{name} Created debris with item {deb.item} and energy {energy}");
-				// Remove, stop, and destroy this bot
-				Location.removeObject(TileLocation, true);
-				if (shell != null) shell.interpreter.Stop();
-				BotManager.instances.Remove(this);
+				ModEntry.instance.Monitor.Log(
+					$"{name} ignored {t.Name} tool action at {Location?.NameOrUniqueName ?? "(null)"} {TileLocation.X},{TileLocation.Y}; bots are persistent and cannot be removed by tools.",
+					LogLevel.Warn);
 				return false;
 			}
 
@@ -982,6 +1107,7 @@ namespace Farmtronics.Bot {
 				}
 				shop.forSale.RemoveAt(index);
 				var botForSale = new BotObject();
+				botForSale.ResetIdentity("shop-restock");
 				botForSale.owner.Value = Game1.player.UniqueMultiplayerID;
 				botForSale.displayName = I18n.Bot_Name(BotManager.botCount);
 				shop.forSale.Insert(index, botForSale);

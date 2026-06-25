@@ -5,12 +5,16 @@ using System.Linq;
 using Farmtronics.Bot;
 using Farmtronics.M1;
 using Farmtronics.Utils;
+using Microsoft.CodeAnalysis;
 using Microsoft.Xna.Framework;
 using Miniscript;
 using StardewModdingAPI;
+using StardewModdingAPI.Events;
 using StardewValley;
+using StardewValley.Buildings;
 using StardewValley.Locations;
 using StardewValley.Network;
+using StardewValley.Objects;
 using StardewValley.Tools;
 
 namespace Farmtronics {
@@ -22,6 +26,7 @@ namespace Farmtronics {
             HarvestCrop,
             WaterCrop,
             PlantCrop,
+            ClearDeadCrop,
             ClearDebris,
             ServiceMachine,
             TillSoil,
@@ -42,6 +47,48 @@ namespace Farmtronics {
             Running,        // script has been queued/sent; shell is executing
             Cooldown,       // bot is waiting briefly before planning again
             Paused,         // bot cannot currently act, e.g. wrong location
+        }
+
+        [Flags]
+        internal enum BotCapability
+        {
+            None = 0,
+            Harvest = 1 << 0,
+            Water = 1 << 1,
+            Plant = 1 << 2,
+            Fertilize = 1 << 3,
+            Till = 1 << 4,
+            Clear = 1 << 5,
+            Machines = 1 << 6,
+            Kegs = 1 << 7,
+            Jars = 1 << 8,
+            SeedMakers = 1 << 9,
+            Furnaces = 1 << 10,
+            Mine = 1 << 11,
+        }
+
+        private enum BotOrderMode
+        {
+            Off,
+            Work,
+            ReturnHome,
+            Follow,
+            Quarantine,
+        }
+
+        private sealed class BotZone
+        {
+            public string Name { get; init; }
+            public string LocationName { get; init; }
+            public Rectangle Bounds { get; init; }
+        }
+
+        private sealed class BotOrders
+        {
+            public BotCapability Capabilities { get; set; }
+            public HashSet<string> AllowedZones { get; } = new(StringComparer.OrdinalIgnoreCase);
+            public BotOrderMode Mode { get; set; } = BotOrderMode.Work;
+            public bool HasCapabilityOverride { get; set; }
         }
         private sealed class BotJob
         {
@@ -73,6 +120,8 @@ namespace Farmtronics {
         {
             public JobType JobType { get; init; }
             public string JobKey { get; init; }
+            public string PlanId { get; init; }
+            public string LocationName { get; init; }
 
             public Vector2 TargetTile { get; init; }
             public Vector2 StandTile { get; init; }
@@ -85,6 +134,19 @@ namespace Farmtronics {
             public int RepathAttempts { get; set; }
         }
 
+        private sealed class BotReservation
+        {
+            public string BotName { get; init; }
+            public string BotGuid { get; init; }
+            public string JobType { get; init; }
+            public string LocationName { get; init; }
+            public Vector2 TargetTile { get; init; }
+            public Vector2 StandTile { get; init; }
+            public Vector2 ReservedTile { get; init; }
+            public TimeSpan CreatedAt { get; init; }
+            public string PlanId { get; init; }
+        }
+
         private sealed class JobMemory
         {
             public int FailureCount { get; set; }
@@ -94,13 +156,53 @@ namespace Farmtronics {
         }
 
         private readonly Dictionary<string, JobMemory> jobMemory = new();
-        private static readonly TimeSpan shortJobCooldown = TimeSpan.FromSeconds(15);
-        private static readonly TimeSpan mediumJobCooldown = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan shortJobCooldown = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan mediumJobCooldown = TimeSpan.FromSeconds(10);
         private const int maxJobFailuresBeforeIgnore = 3;
 
         private SupervisorMode mode = SupervisorMode.Idle;
         private readonly Dictionary<string, BotSupervisorState> botStates = new();
         private readonly Dictionary<string, TimeSpan> blockedTargets = new();
+        private readonly Dictionary<string, TimeSpan> rateLimitedLogTimes = new();
+        private readonly Dictionary<string, BotReservation> ReservedTargetTiles = new();
+        private readonly Dictionary<string, BotReservation> ReservedStandTiles = new();
+        private readonly Dictionary<string, BotReservation> ReservedDestinationTiles = new();
+        private readonly Dictionary<string, BotReservation> ReservedHomeTiles = new();
+        private readonly Dictionary<string, BotOrders> botOrders = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, BotZone> botZones = new(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<string, (string LocationName, Vector2 Tile)> zoneDraftStarts = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan reservationTimeout = TimeSpan.FromMinutes(2);
+        private static readonly string[] resetBotNames = { "keg 1", "forge 1", "seed 1" };
+        private static readonly HashSet<string> resetBotNameSet = new(resetBotNames, StringComparer.OrdinalIgnoreCase);
+        private sealed record BotWorldEntry(BotObject Bot, GameLocation Location, Vector2 Tile);
+        private sealed record BotStoredEntry(BotObject Bot, string Container);
+        private sealed record BotSnapshot(
+            BotObject Bot,
+            string Classification,
+            GameLocation Location,
+            Vector2 Tile,
+            string Container,
+            bool IsTracked,
+            bool IsPlaced,
+            bool IsStored,
+            bool InSupervisorState
+        );
+        private sealed class DedupeSummary
+        {
+            public int DeletedBrickedDuplicates { get; set; }
+            public int QuarantinedDuplicates { get; set; }
+            public int SkippedValuableDuplicates { get; set; }
+            public int RemainingUnknownBots { get; set; }
+        }
+        private readonly Dictionary<string, BotObject> knownCanonicalByGuid = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly Dictionary<string, Vector2> namedHomeTiles = new(StringComparer.OrdinalIgnoreCase)
+        {
+            ["keg 1"] = new Vector2(64, 15),
+            ["seed 1"] = new Vector2(66, 15),
+            ["forge 1"] = new Vector2(68, 15),
+            ["farm 1"] = new Vector2(64, 17),
+            ["farm 2"] = new Vector2(66, 17),
+        };
 
         private sealed record MachineServiceMemory(
             MachineFingerprint Fingerprint,
@@ -108,6 +210,8 @@ namespace Farmtronics {
         );
 
         private readonly Dictionary<Vector2, MachineServiceMemory> _machineServiceMemory = new();
+        private const int AutoPauseTime = 2400; // midnight
+        private bool autoPausedTonight = false;
 
         private bool IsControllableBot(BotObject bot)
         {
@@ -199,8 +303,377 @@ namespace Farmtronics {
                 LogLevel.Trace);
         }
 
+        internal bool TryParseCapability(string text, out BotCapability capability)
+        {
+            capability = BotCapability.None;
+            switch ((text ?? "").Trim().ToLowerInvariant())
+            {
+                case "all":
+                    capability = BotCapability.Harvest
+                        | BotCapability.Water
+                        | BotCapability.Plant
+                        | BotCapability.Fertilize
+                        | BotCapability.Till
+                        | BotCapability.Clear
+                        | BotCapability.Mine;
+                    return true;
+                case "harvest":
+                    capability = BotCapability.Harvest;
+                    return true;
+                case "water":
+                    capability = BotCapability.Water;
+                    return true;
+                case "plant":
+                    capability = BotCapability.Plant;
+                    return true;
+                case "fertilize":
+                case "fertilizer":
+                    capability = BotCapability.Fertilize;
+                    return true;
+                case "till":
+                    capability = BotCapability.Till;
+                    return true;
+                case "clear":
+                case "chop":
+                    capability = BotCapability.Clear;
+                    return true;
+                case "mine":
+                case "mining":
+                    capability = BotCapability.Mine;
+                    return true;
+                case "machines":
+                case "machine":
+                    capability = BotCapability.Machines;
+                    return true;
+                case "kegs":
+                case "keg":
+                    capability = BotCapability.Kegs;
+                    return true;
+                case "jars":
+                case "jar":
+                case "preserves":
+                    capability = BotCapability.Jars;
+                    return true;
+                case "seedmakers":
+                case "seedmaker":
+                case "seed":
+                    capability = BotCapability.SeedMakers;
+                    return true;
+                case "furnaces":
+                case "furnace":
+                case "forge":
+                    capability = BotCapability.Furnaces;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        public void SetBotRole(string botName, IEnumerable<string> capabilityNames)
+        {
+            botName = NormalizeBotName(botName);
+            if (string.IsNullOrWhiteSpace(botName))
+            {
+                ModEntry.instance.Monitor.Log("ft_bot_role refused: missing bot name.", LogLevel.Warn);
+                return;
+            }
+
+            BotCapability capabilities = BotCapability.None;
+            var unknown = new List<string>();
+            foreach (var name in capabilityNames ?? Enumerable.Empty<string>())
+            {
+                if (TryParseCapability(name, out var capability))
+                    capabilities |= capability;
+                else
+                    unknown.Add(name);
+            }
+
+            if (unknown.Count > 0)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"ft_bot_role refused for {botName}: unknown capabilities {string.Join(", ", unknown)}.",
+                    LogLevel.Warn);
+                return;
+            }
+
+            var orders = GetMutableOrders(botName);
+            orders.Capabilities = ExpandMachineCapabilities(capabilities);
+            orders.HasCapabilityOverride = true;
+            var state = FindBotStateByName(botName);
+            if (state?.Bot != null)
+            {
+                ClearBotScriptQueue(state.Bot);
+                ClearCurrentPlan(state);
+                state.Mode = BotMode.Planning;
+                state.NextAllowedPlanAt = Game1.currentGameTime.TotalGameTime + TimeSpan.FromSeconds(1);
+                state.LastNoPlanReason = "Bot role changed.";
+            }
+            ModEntry.instance.Monitor.Log(
+                $"Orders updated for {botName}: capabilities={FormatCapabilities(orders.Capabilities)}.",
+                LogLevel.Warn);
+        }
+
+        public void SetBotOrderMode(string botName, string modeName)
+        {
+            botName = NormalizeBotName(botName);
+            if (string.IsNullOrWhiteSpace(botName))
+            {
+                ModEntry.instance.Monitor.Log("ft_bot_mode refused: missing bot name.", LogLevel.Warn);
+                return;
+            }
+
+            if (!TryParseOrderMode(modeName, out var orderMode))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"ft_bot_mode refused for {botName}: unknown mode '{modeName}'. Use off, work, home, or follow.",
+                    LogLevel.Warn);
+                return;
+            }
+
+            var orders = GetMutableOrders(botName);
+            orders.Mode = orderMode;
+            if (orderMode != BotOrderMode.Work)
+            {
+                var state = FindBotStateByName(botName);
+                if (state?.Bot != null)
+                {
+                    ClearBotScriptQueue(state.Bot);
+                    ClearCurrentPlan(state);
+                    state.Mode = BotMode.Cooldown;
+                    state.NextAllowedPlanAt = Game1.currentGameTime.TotalGameTime + TimeSpan.FromSeconds(1);
+                    state.LastNoPlanReason = $"Bot mode is {orderMode}.";
+                }
+            }
+            ModEntry.instance.Monitor.Log($"Orders updated for {botName}: mode={orderMode}.", LogLevel.Warn);
+        }
+
+        public void StartZoneDraft(string zoneName)
+        {
+            var player = Game1.player;
+            if (player?.currentLocation == null || string.IsNullOrWhiteSpace(zoneName))
+            {
+                ModEntry.instance.Monitor.Log("ft_bot_zone_start refused: missing zone name or player location.", LogLevel.Warn);
+                return;
+            }
+
+            zoneDraftStarts[zoneName.Trim()] = (player.currentLocation.NameOrUniqueName, player.Tile);
+            ModEntry.instance.Monitor.Log(
+                $"Zone start set for {zoneName}: {player.currentLocation.NameOrUniqueName} {(int)player.Tile.X},{(int)player.Tile.Y}.",
+                LogLevel.Warn);
+        }
+
+        public void EndZoneDraft(string zoneName)
+        {
+            var player = Game1.player;
+            if (player?.currentLocation == null || string.IsNullOrWhiteSpace(zoneName))
+            {
+                ModEntry.instance.Monitor.Log("ft_bot_zone_end refused: missing zone name or player location.", LogLevel.Warn);
+                return;
+            }
+
+            zoneName = zoneName.Trim();
+            if (!zoneDraftStarts.TryGetValue(zoneName, out var start))
+            {
+                ModEntry.instance.Monitor.Log($"ft_bot_zone_end refused: no start recorded for zone {zoneName}.", LogLevel.Warn);
+                return;
+            }
+
+            if (!string.Equals(start.LocationName, player.currentLocation.NameOrUniqueName, StringComparison.Ordinal))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"ft_bot_zone_end refused for {zoneName}: start was in {start.LocationName}, current location is {player.currentLocation.NameOrUniqueName}.",
+                    LogLevel.Warn);
+                return;
+            }
+
+            int minX = Math.Min((int)start.Tile.X, (int)player.Tile.X);
+            int minY = Math.Min((int)start.Tile.Y, (int)player.Tile.Y);
+            int maxX = Math.Max((int)start.Tile.X, (int)player.Tile.X);
+            int maxY = Math.Max((int)start.Tile.Y, (int)player.Tile.Y);
+            botZones[zoneName] = new BotZone
+            {
+                Name = zoneName,
+                LocationName = start.LocationName,
+                Bounds = new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1),
+            };
+            zoneDraftStarts.Remove(zoneName);
+
+            ModEntry.instance.Monitor.Log(
+                $"Zone saved: {zoneName} loc={start.LocationName} rect={minX},{minY}..{maxX},{maxY}.",
+                LogLevel.Warn);
+        }
+
+        public void AssignZoneToBot(string botName, string zoneName)
+        {
+            botName = NormalizeBotName(botName);
+            if (string.IsNullOrWhiteSpace(botName) || string.IsNullOrWhiteSpace(zoneName))
+            {
+                ModEntry.instance.Monitor.Log("ft_bot_assign_zone refused: usage ft_bot_assign_zone <bot name> <zone name>.", LogLevel.Warn);
+                return;
+            }
+
+            zoneName = zoneName.Trim();
+            if (!botZones.ContainsKey(zoneName))
+            {
+                ModEntry.instance.Monitor.Log($"ft_bot_assign_zone refused: unknown zone {zoneName}.", LogLevel.Warn);
+                return;
+            }
+
+            var orders = GetMutableOrders(botName);
+            orders.AllowedZones.Add(zoneName);
+            ModEntry.instance.Monitor.Log($"Assigned zone {zoneName} to {botName}.", LogLevel.Warn);
+        }
+
+        public void ReportBotStatus(string botName)
+        {
+            botName = NormalizeBotName(botName);
+            if (string.IsNullOrWhiteSpace(botName))
+            {
+                ModEntry.instance.Monitor.Log("ft_bot_status refused: missing bot name.", LogLevel.Warn);
+                return;
+            }
+
+            var state = FindBotStateByName(botName);
+            var bot = state?.Bot ?? BotManager.GetAllBots().FirstOrDefault(bot => string.Equals(bot?.name, botName, StringComparison.OrdinalIgnoreCase));
+            var orders = GetOrdersForBot(bot?.name ?? botName);
+
+            ModEntry.instance.Monitor.Log(
+                $"Bot status {botName}: loc={bot?.currentLocation?.NameOrUniqueName ?? "(unknown)"} tile={bot?.TileLocation.X},{bot?.TileLocation.Y} supervisorMode={state?.Mode.ToString() ?? "(untracked)"} orderMode={orders.Mode} capabilities={FormatCapabilities(orders.Capabilities)} zones={FormatZones(orders)} idleReason={state?.LastNoPlanReason ?? "(none)"} currentPlan={DescribePlan(state?.CurrentPlan)}.",
+                LogLevel.Warn);
+        }
+
+        private static bool TryParseOrderMode(string text, out BotOrderMode mode)
+        {
+            mode = BotOrderMode.Work;
+            switch ((text ?? "").Trim().ToLowerInvariant())
+            {
+                case "off":
+                    mode = BotOrderMode.Off;
+                    return true;
+                case "work":
+                    mode = BotOrderMode.Work;
+                    return true;
+                case "home":
+                case "return-home":
+                    mode = BotOrderMode.ReturnHome;
+                    return true;
+                case "follow":
+                    mode = BotOrderMode.Follow;
+                    return true;
+                case "quarantine":
+                    mode = BotOrderMode.Quarantine;
+                    return true;
+                default:
+                    return false;
+            }
+        }
+
+        private BotOrders GetMutableOrders(string botName)
+        {
+            botName = NormalizeBotName(botName);
+            if (!botOrders.TryGetValue(botName, out var orders))
+            {
+                orders = BuildDefaultOrders(botName);
+                botOrders[botName] = orders;
+            }
+
+            return orders;
+        }
+
+        private BotOrders GetOrdersForBot(BotObject bot)
+        {
+            return GetOrdersForBot(bot?.name);
+        }
+
+        private BotOrders GetOrdersForBot(string botName)
+        {
+            botName = NormalizeBotName(botName);
+            if (botOrders.TryGetValue(botName, out var orders))
+                return orders;
+
+            return BuildDefaultOrders(botName);
+        }
+
+        private static string NormalizeBotName(string botName)
+        {
+            botName = (botName ?? "").Trim();
+            if (botName.Length >= 2
+                && ((botName[0] == '"' && botName[^1] == '"')
+                    || (botName[0] == '\'' && botName[^1] == '\'')))
+            {
+                botName = botName[1..^1].Trim();
+            }
+
+            return botName;
+        }
+
+        private BotSupervisorState FindBotStateByName(string botName)
+        {
+            botName = NormalizeBotName(botName);
+            return botStates.Values.FirstOrDefault(state =>
+                string.Equals(NormalizeBotName(state.BotName), botName, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(NormalizeBotName(state.Bot?.name), botName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private BotOrders BuildDefaultOrders(string botName)
+        {
+            var orders = new BotOrders
+            {
+                Capabilities = BotCapability.Harvest | BotCapability.Water | BotCapability.Till | BotCapability.Clear | BotCapability.Mine,
+                Mode = BotOrderMode.Work,
+            };
+
+            if (TryGetAllowedMachinesForBot(botName, out var allowedMachines))
+            {
+                orders.Capabilities = CapabilitiesForMachines(allowedMachines);
+            }
+
+            return orders;
+        }
+
+        private static BotCapability CapabilitiesForMachines(HashSet<string> allowedMachines)
+        {
+            BotCapability capabilities = BotCapability.Machines;
+            if (allowedMachines.Contains("Keg"))
+                capabilities |= BotCapability.Kegs;
+            if (allowedMachines.Contains("Preserves Jar"))
+                capabilities |= BotCapability.Jars;
+            if (allowedMachines.Contains("Seed Maker"))
+                capabilities |= BotCapability.SeedMakers;
+            if (allowedMachines.Contains("Furnace") || allowedMachines.Contains("Charcoal Kiln"))
+                capabilities |= BotCapability.Furnaces;
+            return capabilities;
+        }
+
+        private static BotCapability ExpandMachineCapabilities(BotCapability capabilities)
+        {
+            if ((capabilities & (BotCapability.Kegs | BotCapability.Jars | BotCapability.SeedMakers | BotCapability.Furnaces)) != 0)
+                capabilities |= BotCapability.Machines;
+            return capabilities;
+        }
+
+        private static string FormatCapabilities(BotCapability capabilities)
+        {
+            return capabilities == BotCapability.None ? "none" : capabilities.ToString();
+        }
+
+        private static string FormatZones(BotOrders orders)
+        {
+            return orders == null || orders.AllowedZones.Count == 0
+                ? "(default/current location)"
+                : string.Join(",", orders.AllowedZones.OrderBy(zone => zone));
+        }
+
+        private static string DescribePlan(PendingPlan plan)
+        {
+            if (plan == null)
+                return "(none)";
+
+            return $"{plan.JobType} {plan.LocationName} {(int)plan.TargetTile.X},{(int)plan.TargetTile.Y}";
+        }
+
 		private static readonly HashSet<string> clearTypes = new() { "Tree", "Stone", "Twig", "Weeds", "Grass" };
-		private static readonly TimeSpan blockedCooldown = TimeSpan.FromSeconds(6);
+		private static readonly TimeSpan blockedCooldown = TimeSpan.FromSeconds(5);
 		private static readonly TimeSpan stuckTimeout = TimeSpan.FromSeconds(2);
         private readonly Dictionary<string, int> targetFailureCounts = new();
         private static readonly int maxTargetFailures = 2;
@@ -240,6 +713,17 @@ namespace Farmtronics {
             botStates.Clear();
             blockedTargets.Clear();
             targetFailureCounts.Clear();
+            jobMemory.Clear();
+            _machineServiceMemory.Clear();
+            _machineCooldownUntilTick.Clear();
+            _lastServicedMachines.Clear();
+            botOrders.Clear();
+            botZones.Clear();
+            zoneDraftStarts.Clear();
+            ReservedTargetTiles.Clear();
+            ReservedStandTiles.Clear();
+            ReservedDestinationTiles.Clear();
+            ReservedHomeTiles.Clear();
             ModEntry.instance.Monitor.Log("Supervisor reset.");
         }
 
@@ -249,6 +733,13 @@ namespace Farmtronics {
             botStates.Clear();
             blockedTargets.Clear();
             targetFailureCounts.Clear();
+            botOrders.Clear();
+            botZones.Clear();
+            zoneDraftStarts.Clear();
+            ReservedTargetTiles.Clear();
+            ReservedStandTiles.Clear();
+            ReservedDestinationTiles.Clear();
+            ReservedHomeTiles.Clear();
             ModEntry.instance.Monitor.Log("Supervisor stopped.");
         }
 
@@ -256,17 +747,56 @@ namespace Farmtronics {
 			mode = SupervisorMode.AllBots;
 			blockedTargets.Clear();
 			targetFailureCounts.Clear();
+            ReservedTargetTiles.Clear();
+            ReservedStandTiles.Clear();
+            ReservedDestinationTiles.Clear();
+            ReservedHomeTiles.Clear();
 			LoadBotStatesToSupervisor(singleBot: false);
 			ModEntry.instance.Monitor.Log("Supervisor started: all-bots.");
 		}
+
+        private void CheckAutoPauseAtMidnight()
+        {
+            if (!Context.IsWorldReady)
+                return;
+
+            if (Game1.timeOfDay < 600)
+            {
+                autoPausedTonight = false;
+                return;
+            }
+
+            if (autoPausedTonight)
+                return;
+
+            if (Game1.timeOfDay < AutoPauseTime)
+                return;
+
+            autoPausedTonight = true;
+
+            if (Game1.activeClickableMenu != null)
+                return;
+
+            Game1.activeClickableMenu = new StardewValley.Menus.GameMenu();
+
+            ModEntry.instance.Monitor.Log(
+                $"Auto-pause: opened menu at time {Game1.timeOfDay}.",
+                LogLevel.Warn);
+        }
+
         public void Update(GameTime gameTime)
         {
             if (!Context.IsMainPlayer) return;
             if (!Context.IsWorldReady) return;
+
+            CheckAutoPauseAtMidnight();
+            ValidateBotPersistence();
+
             if (mode == SupervisorMode.Idle) return;
 
             TimeSpan now = gameTime.TotalGameTime;
             CleanupBlockedTargets(now);
+            CleanupStaleReservations(now);
 
             foreach (var state in botStates.Values.ToList())
             {
@@ -299,6 +829,18 @@ namespace Farmtronics {
                 case BotMode.Queued:
                     if (bot.shell.IsReadyForCommand())
                     {
+                        if (!ValidatePlanForExecution(state, out string reason))
+                        {
+                            LogPlanToolSafety(bot, state.CurrentPlan, allowed: false, reason);
+                            ClearBotScriptQueue(bot);
+                            ClearCurrentPlan(state);
+                            state.Mode = BotMode.Cooldown;
+                            state.NextAllowedPlanAt = now + TimeSpan.FromSeconds(1);
+                            state.LastNoPlanReason = reason;
+                            break;
+                        }
+
+                        LogPlanToolSafety(bot, state.CurrentPlan, allowed: true, "validated");
                         ModEntry.instance.Monitor.Log($"Supervisor sending script to {bot.name} for target tile {state.CurrentPlan.TargetTile.X},{state.CurrentPlan.TargetTile.Y} name {state.CurrentPlan.TargetName}");
                         bot.shell.QueueCommand(state.CurrentPlan.Script);
                         state.CurrentPlan.QueuedAt = now;
@@ -325,13 +867,13 @@ namespace Farmtronics {
                     }
                     break;
                 case BotMode.Idle:
-                    state.CurrentPlan = null;
-                    state.NextAllowedPlanAt = now + TimeSpan.FromSeconds(30);
+                    ClearCurrentPlan(state);
+                    state.NextAllowedPlanAt = now + TimeSpan.FromSeconds(10);
                     state.Mode = BotMode.Cooldown;
                     break;
             }
         }   
-        private static readonly TimeSpan machineFailedAttemptCooldown = TimeSpan.FromSeconds(20);
+        private static readonly TimeSpan machineFailedAttemptCooldown = TimeSpan.FromSeconds(10);
 
         private void MarkMachineServiceAttempted(GameLocation location, Vector2 tile, TimeSpan now)
         {
@@ -371,7 +913,7 @@ namespace Farmtronics {
                     LogLevel.Trace);
 
                 BlockTarget(bot.currentLocation, plan.TargetTile, now);
-                state.CurrentPlan = null;
+                ClearCurrentPlan(state);
                 state.NextAllowedPlanAt = now + blockedCooldown;
                 state.Mode = BotMode.Cooldown;
                 return false;
@@ -424,8 +966,23 @@ namespace Farmtronics {
 
             if (bot == null || plan == null)
             {
-                state.CurrentPlan = null;
+                ClearCurrentPlan(state);
                 state.Mode = BotMode.Planning;
+                return;
+            }
+
+            if (plan.JobType == JobType.ServiceMachine)
+            {
+                MarkMachineServiceAttempted(bot.currentLocation, plan.TargetTile, now);
+
+                ModEntry.instance.Monitor.Log(
+                    $"Supervisor: machine service attempt complete for {bot.name}: " +
+                    $"{plan.TargetName} at {plan.TargetTile.X},{plan.TargetTile.Y}",
+                    LogLevel.Trace);
+
+                ClearCurrentPlan(state);
+                state.Mode = BotMode.Cooldown;
+                state.NextAllowedPlanAt = now + TimeSpan.FromSeconds(2);
                 return;
             }
 
@@ -443,7 +1000,7 @@ namespace Farmtronics {
                 // If repath fails, then give up/block.
                 BlockTarget(bot.currentLocation, plan.TargetTile, now);
 
-                state.CurrentPlan = null;
+                ClearCurrentPlan(state);
                 state.NextAllowedPlanAt = now + blockedCooldown;
                 state.Mode = BotMode.Cooldown;
                 return;
@@ -458,7 +1015,7 @@ namespace Farmtronics {
                     $"{plan.TargetName} at {plan.TargetTile.X},{plan.TargetTile.Y}",
                     LogLevel.Trace);
 
-                state.CurrentPlan = null;
+                ClearCurrentPlan(state);
                 state.NextAllowedPlanAt = now + TimeSpan.FromMilliseconds(250);
                 state.Mode = BotMode.Cooldown;
                 return;
@@ -472,7 +1029,7 @@ namespace Farmtronics {
                 RecordTargetFailure(bot.currentLocation, plan.TargetTile);
                 BlockTarget(bot.currentLocation, plan.TargetTile, now);
 
-                state.CurrentPlan = null;
+                ClearCurrentPlan(state);
                 state.NextAllowedPlanAt = now + blockedCooldown;
                 state.Mode = BotMode.Cooldown;
                 return;
@@ -481,20 +1038,126 @@ namespace Farmtronics {
             ModEntry.instance.Monitor.Log(
                 $"Supervisor plan completed for {bot.name}: {plan.JobType} target {plan.TargetTile.X},{plan.TargetTile.Y} name {plan.TargetName}");
 
-            state.CurrentPlan = null;
+            ClearCurrentPlan(state);
             state.Mode = BotMode.Planning;
         }
 
         private List<BotJob> BuildJobsForLocation(GameLocation location, BotSupervisorState state)
         {
-            return location switch
+            var orders = GetOrdersForBot(state?.Bot);
+            if (orders.Mode != BotOrderMode.Work)
+            {
+                state.LastNoPlanReason = $"Bot mode is {orders.Mode}.";
+                return new List<BotJob>();
+            }
+
+            var jobs = new List<BotJob>();
+            if ((orders.Capabilities & BotCapability.Machines) != 0)
+                jobs.AddRange(BuildMachineJobsForLocation(location));
+
+            if (orders.AllowedZones.Count > 0)
+            {
+                jobs.AddRange(BuildZoneJobsForLocation(location, state, orders));
+                return jobs.Where(job => IsJobAllowedByOrders(state, job, orders)).ToList();
+            }
+
+            var defaultJobs = location switch
             {
                 Farm farm => BuildFarmJobs(farm, state),
+                GameLocation greenhouse
+                    when greenhouse.NameOrUniqueName == "Greenhouse"
+                    => BuildFarmJobs(greenhouse, state),
                 MineShaft mine => BuildMineJobs(mine, state),
                 Woods woods => BuildClearAllJobs(location, state),
                 Mountain mountain => BuildClearAllJobs(location, state),
+                Forest forest => BuildClearAllJobs(location, state),
                 _ => new List<BotJob>(),
             };
+
+            jobs.AddRange(defaultJobs);
+            return jobs.Where(job => IsJobAllowedByOrders(state, job, orders)).ToList();
+        }
+
+        private List<BotJob> BuildZoneJobsForLocation(GameLocation location, BotSupervisorState state, BotOrders orders)
+        {
+            var jobs = new List<BotJob>();
+            if (location == null || orders == null)
+                return jobs;
+
+            foreach (var zoneName in orders.AllowedZones)
+            {
+                if (!botZones.TryGetValue(zoneName, out var zone))
+                    continue;
+
+                if (!string.Equals(zone.LocationName, location.NameOrUniqueName, StringComparison.Ordinal))
+                    continue;
+
+                int maxX = Math.Min(zone.Bounds.Right, location.map.Layers[0].LayerWidth);
+                int maxY = Math.Min(zone.Bounds.Bottom, location.map.Layers[0].LayerHeight);
+                for (int y = Math.Max(0, zone.Bounds.Top); y < maxY; y++)
+                {
+                    for (int x = Math.Max(0, zone.Bounds.Left); x < maxX; x++)
+                    {
+                        var tile = new Vector2(x, y);
+                        if (TryGetTileJobForOrders(location, tile, state, orders, out var job))
+                            jobs.Add(job);
+                    }
+                }
+            }
+
+            return jobs;
+        }
+
+        private bool TryGetTileJobForOrders(GameLocation location, Vector2 tile, BotSupervisorState state, BotOrders orders, out BotJob job)
+        {
+            job = null;
+            if (orders == null)
+                return false;
+
+            if ((orders.Capabilities & (BotCapability.Harvest | BotCapability.Water | BotCapability.Plant | BotCapability.Till | BotCapability.Clear | BotCapability.Mine)) != 0
+                && TryGetFarmJob(location, tile, state, out var farmJob)
+                && IsJobAllowedByOrders(state, farmJob, orders))
+            {
+                job = farmJob;
+                return true;
+            }
+
+            if ((orders.Capabilities & (BotCapability.Clear | BotCapability.Mine)) != 0
+                && TryGetClearAllJob(location, tile, out string targetName))
+            {
+                var adjacentTiles = GetAdjacentPassableTiles(location, tile).ToList();
+                if (adjacentTiles.Count == 0)
+                    return false;
+
+                job = new BotJob
+                {
+                    Type = targetName == "Stone" ? JobType.MineBreakStone : targetName == "Weeds" ? JobType.MineCutWeeds : JobType.ClearDebris,
+                    JobKey = GetJobKey(location, targetName == "Stone" ? JobType.MineBreakStone : targetName == "Weeds" ? JobType.MineCutWeeds : JobType.ClearDebris, tile),
+                    TargetName = targetName,
+                    TargetTile = tile,
+                    AdjacentTile = adjacentTiles.First(),
+                    BasePriority = 100,
+                };
+                return IsJobAllowedByOrders(state, job, orders);
+            }
+
+            return false;
+        }
+
+        private List<BotJob> BuildMachineJobsForLocation(GameLocation location)
+        {
+            var jobs = new List<BotJob>();
+            if (location == null)
+                return jobs;
+
+            TimeSpan timestamp = Game1.currentGameTime?.TotalGameTime ?? new TimeSpan(DateTime.Now.Ticks);
+            foreach (var pair in location.objects.Pairs)
+            {
+                if (TryBuildMachineJob(location, pair.Key, timestamp, out BotJob machineJob))
+                    jobs.Add(machineJob);
+            }
+
+            return jobs;
         }
         private List<BotJob> BuildClearAllJobs(GameLocation location, BotSupervisorState state)
         {
@@ -503,9 +1166,9 @@ namespace Farmtronics {
             int width = location.map.Layers[0].LayerWidth;
             int height = location.map.Layers[0].LayerHeight;
 
-            for (int y = 0; y < height; y++)
+            for (int y = 1; y < height; y++)
             {
-                for (int x = 0; x < width; x++)
+                for (int x = 1; x < width; x++)
                 {
                     var tile = new Vector2(x, y);
 
@@ -529,6 +1192,108 @@ namespace Farmtronics {
 
             return jobs;
         }
+        private void ReportBotInventory(BotObject bot)
+        {
+            if (bot == null)
+                return;
+
+            ModEntry.instance.Monitor.Log($"Inventory for {bot.name}:", LogLevel.Warn);
+
+            for (int slot = 0; slot < bot.farmer.Items.Count; slot++) // replace Items if needed
+            {
+                var item = bot.farmer.Items[slot];
+
+                if (item == null)
+                {
+                    ModEntry.instance.Monitor.Log($"  slot {slot}: empty", LogLevel.Warn);
+                    continue;
+                }
+
+                ModEntry.instance.Monitor.Log(
+                    $"  slot {slot}: qty={item.Stack} " +
+                    $"name={item.Name} display={item.DisplayName} " +
+                    $"type={item.GetType().FullName} " +
+                    $"category={item.Category} " +
+                    $"itemId={item.ItemId} qualified={item.QualifiedItemId}",
+                    LogLevel.Warn);
+            }
+        }
+        private bool TryGetFarmJob(GameLocation location, Vector2 tile, BotSupervisorState state, out BotJob job){
+            job = null;
+            var adjacentTiles = GetAdjacentPassableTiles(location, tile).ToList();
+            if (adjacentTiles.Count == 0){   
+                return false;
+            }
+            if(IsHarvestableCropTile(location, tile, out string targetName))  {
+                job = new BotJob
+                {
+                    Type = JobType.HarvestCrop,
+                    JobKey = GetJobKey(location, JobType.HarvestCrop, tile),
+                    TargetName = targetName,
+                    TargetTile = tile,
+                    AdjacentTile = adjacentTiles.First(), // improve later
+                    BasePriority = 120,
+                };   
+                return true;                   
+            }
+            if (isClearDeadCropTile(location, tile))  {
+                job = new BotJob
+                {
+                    Type = JobType.ClearDeadCrop,
+                    JobKey = GetJobKey(location, JobType.ClearDeadCrop, tile),
+                    TargetName = "Dead Crop",
+                    TargetTile = tile,
+                    AdjacentTile = adjacentTiles.First(), // improve later
+                    RequiresScythe = true,
+                    BasePriority = 125,
+                };   
+                return true;                                     
+            }
+            if(IsPlantCropTile(location, tile, out string targetPlanting, out bool canFertilize))  {
+                bool botCanFertilize = (GetOrdersForBot(state?.Bot).Capabilities & BotCapability.Fertilize) != 0;
+                job = new BotJob
+                {
+                    Type = JobType.PlantCrop,
+                    JobKey = GetJobKey(location, JobType.PlantCrop, tile),
+                    TargetName = targetPlanting,
+                    TargetTile = tile,
+                    AdjacentTile = adjacentTiles.First(), // improve later
+                    CanFertilize = canFertilize && botCanFertilize,
+                    BasePriority = 100 + (canFertilize ? 25 : 0),
+                };    
+                return true;                                     
+            }
+            if (IsDryCropTile(location, tile))  {
+                job = new BotJob
+                {
+                    Type = JobType.WaterCrop,
+                    JobKey = GetJobKey(location, JobType.WaterCrop, tile),
+                    TargetName = "Dry Crop",
+                    TargetTile = tile,
+                    AdjacentTile = adjacentTiles.First(), // improve later
+                    BasePriority = 100,
+                };     
+                return true;                                     
+            }      
+            if (IsClearableTile(location, tile, out string harvestName)) {
+                job = new BotJob
+                {
+                    Type = JobType.ClearDebris,
+                    JobKey = GetJobKey(location, JobType.ClearDebris, tile),
+                    TargetName = harvestName,
+                    TargetTile = tile,
+                    AdjacentTile = adjacentTiles.First(), // improve later
+                    BasePriority = 100,
+                };   
+                return true;                  
+            }                 
+            if (TryBuildTillSoilJob(location, tile, out BotJob tillSoilJob))
+            {
+                job = tillSoilJob;  
+                return true;                
+            };    
+            return false;
+        }  
         private List<BotJob> BuildMineJobs(MineShaft mine, BotSupervisorState state)
         {
             var jobs = new List<BotJob>();
@@ -556,109 +1321,66 @@ namespace Farmtronics {
                             AdjacentTile = adjacentTiles.First(),
                             BasePriority = priority,
                         });
+                        continue;
+                    }
+
+                    if (TryBuildTillSoilJob(mine, tile, out BotJob mineTillJob, basePriority: 250, targetName: "Mine Floor"))
+                    {
+                        jobs.Add(mineTillJob);
                     }
                 }
             }
 
             return jobs;
         }
-        private List<BotJob> BuildFarmJobs(Farm farm, BotSupervisorState state)
+        private List<BotJob> BuildFarmJobs(GameLocation location, BotSupervisorState state)
         {
             var jobs = new List<BotJob>();
 
-            int width = farm.map.Layers[0].LayerWidth;
-            int height = farm.map.Layers[0].LayerHeight;
-            // Machine Area
-            for (int y = 10; y < 22; y++)
-            {
-                for (int x = 46; x < width; x++)
+            int width = location.map.Layers[0].LayerWidth;
+            int height = location.map.Layers[0].LayerHeight;
+
+            bool isGreenhouse = location.NameOrUniqueName == "Greenhouse";
+            
+
+            if(isGreenhouse){
+                for (int y = 10; y < 20; y++)
                 {
-                    var tile = new Vector2(x, y);
-                    TimeSpan timestamp = new TimeSpan(DateTime.Now.Ticks);
-                    if (TryBuildMachineJob(farm, tile, timestamp,  out BotJob machineJob)) {
-                        jobs.Add(machineJob);
-                        continue;
-                    }  
-                }
-            }
-            // Crop Area
-            for (int y = 22; y < height; y++)
-            {
-                for (int x = 26; x < width; x++)
-                {
-                    var tile = new Vector2(x, y);
-
-                    //ModEntry.instance.Monitor.Log($"Building job for tile {tile.X},{tile.Y}", LogLevel.Trace);
-
-
-                    var adjacentTiles = GetAdjacentPassableTiles(farm, tile).ToList();
-                    if (adjacentTiles.Count == 0){
-                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} NO ADJACENT TILES", LogLevel.Trace);
-                        continue;                     
-                    }
-                    if(IsHarvestableCropTile(farm, tile, out string targetName, out bool requiresScythe))  {
-                        jobs.Add(new BotJob
-                        {
-                            Type = JobType.HarvestCrop,
-                            JobKey = GetJobKey(farm, JobType.HarvestCrop, tile),
-                            TargetName = targetName,
-                            TargetTile = tile,
-                            AdjacentTile = adjacentTiles.First(), // improve later
-                            BasePriority = requiresScythe ? 120 : 110,
-                        });   
-                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {targetName} \"HarvestCrop\"", LogLevel.Trace);
-                        continue;                     
-                    }
-                    if(IsPlantCropTile(farm, tile, out string targetPlanting, out bool clearAhead, out bool canFertilize))  {
-                        jobs.Add(new BotJob
-                        {
-                            Type = JobType.PlantCrop,
-                            JobKey = GetJobKey(farm, JobType.PlantCrop, tile),
-                            TargetName = targetPlanting,
-                            TargetTile = tile,
-                            AdjacentTile = adjacentTiles.First(), // improve later
-                            BasePriority = 100 + (clearAhead ? 50 : 0) + (canFertilize ? 25 : 0),
-                        });   
-                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {targetPlanting} \"PlantCrop\"", LogLevel.Trace);
-                        continue;                                        
-                    }
-                    if (IsDryCropTile(farm, tile))  {
-                        jobs.Add(new BotJob
-                        {
-                            Type = JobType.WaterCrop,
-                            JobKey = GetJobKey(farm, JobType.WaterCrop, tile),
-                            TargetName = "Dry Crop",
-                            TargetTile = tile,
-                            AdjacentTile = adjacentTiles.First(), // improve later
-                            BasePriority = 100,
-                        });   
-                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {targetName} \"WaterCrop\"", LogLevel.Trace);
-                        continue;                                         
-                    }      
-                    if (IsClearableTile(farm, tile, out string harvestName)) {
-                        jobs.Add(new BotJob
-                        {
-                            Type = JobType.ClearDebris,
-                            JobKey = GetJobKey(farm, JobType.ClearDebris, tile),
-                            TargetName = harvestName,
-                            TargetTile = tile,
-                            AdjacentTile = adjacentTiles.First(), // improve later
-                            BasePriority = 100,
-                        });
-                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {harvestName} \"ClearDebris\"", LogLevel.Trace);
-                        continue;                     
-                    }
-                    //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} checking Tillable", LogLevel.Trace);                   
-                    if (TryBuildTillSoilJob(farm, tile, out BotJob tillSoilJob))
+                    for (int x = 3; x < 16; x++)
                     {
-                        jobs.Add(tillSoilJob);
-                        //ModEntry.instance.Monitor.Log($"Job {tile.X},{tile.Y} added: {tillSoilJob.TargetName} \"TillSoil\"", LogLevel.Trace);
-                        continue;                     
-                    };      
+                        var tile = new Vector2(x, y);
+                        if(TryGetFarmJob(location, tile, state, out BotJob farmJob)) {
+                            jobs.Add(farmJob);
+                        }
+                    }
+                }
+            } else {
+                    // Machine Area
+                for (int y = 10; y < 22; y++)
+                {
+                    for (int x = 16; x < width; x++)
+                    {
+                        var tile = new Vector2(x, y);
+                        TimeSpan timestamp = new TimeSpan(DateTime.Now.Ticks);
+                        if (TryBuildMachineJob(location, tile, timestamp,  out BotJob machineJob)) {
+                            jobs.Add(machineJob);
+                            continue;
+                        }  
+                    }
+                }
+                    // Crop Area
+                for (int y = 22; y < height-4; y++)
+                {
+                    for (int x = 26; x < width; x++)
+                    {
+                        var tile = new Vector2(x, y);
+                        if(TryGetFarmJob(location, tile, state, out BotJob farmJob)) {
+                            jobs.Add(farmJob);
+                        }
+                    }  
 
                 }
             }
-
             return jobs;
         }
         private static string GetJobKey(GameLocation location, JobType type, Vector2 tile)
@@ -668,14 +1390,110 @@ namespace Farmtronics {
         }
         private bool IsPlanStillValid(GameLocation location, PendingPlan plan)
         {
-            if (plan.JobType == JobType.TillSoil)
-                return IsStillTillable(location, plan.TargetTile);
+            if (location == null || plan == null)
+                return false;
+
+            return plan.JobType switch
+            {
+                JobType.TillSoil => IsStillTillable(location, plan.TargetTile),
+                JobType.ClearDebris => IsClearableTile(location, plan.TargetTile, out _)
+                    && !IsUnsafePlacedObject(location, plan.TargetTile),
+                JobType.WaterCrop => IsDryCropTile(location, plan.TargetTile),
+                JobType.HarvestCrop => IsHarvestableCropTile(location, plan.TargetTile, out _),
+                JobType.PlantCrop => IsPlantCropTile(location, plan.TargetTile, out _, out _),
+                JobType.ClearDeadCrop => isClearDeadCropTile(location, plan.TargetTile),
+                JobType.ServiceMachine => IsExpectedMachine(location, plan.TargetTile, plan.TargetName),
+                JobType.MineBreakStone => IsNamedObjectTile(location, plan.TargetTile, "Stone"),
+                JobType.MineCutWeeds => IsNamedObjectTile(location, plan.TargetTile, "Weeds"),
+                _ => false,
+            };
+        }
+
+        private bool ValidatePlanForExecution(BotSupervisorState state, out string reason)
+        {
+            reason = null;
+
+            var bot = state?.Bot;
+            var plan = state?.CurrentPlan;
+
+            if (bot == null)
+            {
+                reason = "bot is null";
+                return false;
+            }
+
+            if (plan == null)
+            {
+                reason = "plan is null";
+                return false;
+            }
+
+            var location = bot.currentLocation;
+            if (location == null)
+            {
+                reason = "bot location is null";
+                return false;
+            }
+
+            if (!string.Equals(location.NameOrUniqueName, plan.LocationName, StringComparison.Ordinal))
+            {
+                reason = $"location changed from {plan.LocationName} to {location.NameOrUniqueName}";
+                return false;
+            }
+
+            if (bot.TileLocation != plan.StartTile)
+            {
+                reason = $"bot moved before script start: expected {plan.StartTile.X},{plan.StartTile.Y}; got {bot.TileLocation.X},{bot.TileLocation.Y}";
+                return false;
+            }
+
+            if (!IsPlanStillValid(location, plan))
+            {
+                reason = "target is no longer valid for job";
+                return false;
+            }
+
+            var pseudoJob = new BotJob
+            {
+                Type = plan.JobType,
+                TargetTile = plan.TargetTile,
+                AdjacentTile = plan.StandTile,
+                TargetName = plan.TargetName,
+            };
+            reason = GetJobReservationRejectionReason(state, pseudoJob, location);
+            if (reason != null)
+                return false;
 
             return true;
         }
+
+        private void LogPlanToolSafety(BotObject bot, PendingPlan plan, bool allowed, string reason)
+        {
+            if (bot == null || plan == null)
+                return;
+
+            var location = bot.currentLocation;
+            ValMap info = location == null ? null : TileInfo.GetInfo(location, plan.TargetTile);
+
+            string type = info?.GetString("type") ?? "(null)";
+            string name = info?.GetString("name") ?? "(null)";
+            string crop = "(none)";
+
+            if (info != null && info.map.TryGetValue(new ValString("crop"), out Value cropValue) && cropValue is ValMap cropInfo)
+                crop = cropInfo.GetString("name") ?? "(crop)";
+
+            ModEntry.instance.Monitor.Log(
+                $"Tool safety {(allowed ? "allowed" : "refused")}: bot={bot.name}; " +
+                $"loc={location?.NameOrUniqueName ?? "(null)"}; botTile={bot.TileLocation.X},{bot.TileLocation.Y}; " +
+                $"facing={bot.facingDirection}; target={plan.TargetTile.X},{plan.TargetTile.Y}; " +
+                $"job={plan.JobType}; targetType={type}; targetName={name}; crop={crop}; reason={reason}",
+                allowed ? LogLevel.Trace : LogLevel.Warn);
+        }
+
         private void TryCreatePlanForBot(BotSupervisorState state, TimeSpan now)
         {
             var bot = state.Bot;
+
             if (bot == null)
             {
                 state.Mode = BotMode.Paused;
@@ -684,14 +1502,17 @@ namespace Farmtronics {
             }
 
             var location = bot.currentLocation;
+            state.LastNoPlanReason = null;
 
             var allJobs = BuildJobsForLocation(bot.currentLocation, state).ToList();
+            if (allJobs.Count == 0 && string.IsNullOrWhiteSpace(state.LastNoPlanReason))
+                state.LastNoPlanReason = $"No jobs generated for capabilities/zones in {location?.NameOrUniqueName ?? "(null)"}.";
 
             var jobs = new List<BotJob>();
 
             foreach (var job in allJobs)
             {
-                TryGetAllowedMachinesForBot(bot.name, out var allowedMachines);
+                    
                 var score = ScoreJobForBot(state, job);
 
                 if (IsTargetIgnored(location, job.TargetTile))
@@ -712,16 +1533,21 @@ namespace Farmtronics {
                     continue;
                 }
 
+                string reservationReason = GetJobReservationRejectionReason(state, job, location);
+                if (reservationReason != null)
+                {
+                    ModEntry.instance.Monitor.Log(
+                        $"Rejecting {job.Type} at {location?.NameOrUniqueName ?? "(null)"} {(int)job.TargetTile.X},{(int)job.TargetTile.Y} for {bot.name}: {reservationReason}.",
+                        LogLevel.Trace);
+                    LogRejectedJob(job, reservationReason, score);
+                    continue;
+                }
+
                 if (!BotCanDoJob(state, job))
                 {
                     LogRejectedJob(job, "bot cannot do job", score);
                     continue;
                 }
-
-                /*ModEntry.instance.Monitor.Log(
-                    $"Accepted job: {job.GetType().Name} target={job.TargetTile.X},{job.TargetTile.Y} " +
-                    $"name={job.TargetName} score={score}",
-                    LogLevel.Trace);*/
 
                 jobs.Add(job);
             }
@@ -730,6 +1556,8 @@ namespace Farmtronics {
                 .OrderByDescending(job => ScoreJobForBot(state, job))
                 .ToList();
 
+            if (allJobs.Count > 0 && jobs.Count == 0)
+                state.LastNoPlanReason = "All generated jobs were rejected by orders, reservations, tools, inventory, or safety checks.";
 
 			foreach (var job in jobs)
             {
@@ -771,6 +1599,8 @@ namespace Farmtronics {
                 {
                     JobType = job.Type,
                     JobKey = job.JobKey,
+                    PlanId = Guid.NewGuid().ToString("N"),
+                    LocationName = location.NameOrUniqueName,
                     TargetTile = job.TargetTile,
                     StandTile = job.AdjacentTile,
                     TargetName = job.TargetName,
@@ -778,6 +1608,15 @@ namespace Farmtronics {
                     Script = script,
                     QueuedAt = null,
                 };
+
+                if (!TryReservePlanForBot(state, state.CurrentPlan, now, out string reserveReason))
+                {
+                    ModEntry.instance.Monitor.Log(
+                        $"Rejecting {job.Type} at {location?.NameOrUniqueName ?? "(null)"} {(int)job.TargetTile.X},{(int)job.TargetTile.Y} for {bot.name}: {reserveReason}.",
+                        LogLevel.Trace);
+                    ClearCurrentPlan(state);
+                    continue;
+                }
 
                 state.Mode = BotMode.Queued;
                 state.LastNoPlanReason = null;
@@ -788,9 +1627,10 @@ namespace Farmtronics {
                 return;
             }
 
-            state.CurrentPlan = null;
+            ClearCurrentPlan(state);
             state.Mode = BotMode.Idle;
-            state.LastNoPlanReason = "No reachable target found.";
+            if (string.IsNullOrWhiteSpace(state.LastNoPlanReason))
+                state.LastNoPlanReason = "No reachable target found.";
 
             ModEntry.instance.Monitor.Log(
                 $"Supervisor has no plan for {bot.name}: {state.LastNoPlanReason}");
@@ -806,67 +1646,93 @@ namespace Farmtronics {
                 $"name={job.TargetName} score={score} reason={reason}",
                 LogLevel.Trace);*/
         }
-        private bool BotHasInventoryCategory(BotObject bot, int category)
-        {
-            if (bot == null) return false;
-
-            foreach (var item in bot.inventory) 
-            {
-                if (item == null) continue;
-                if (item.Category == category)
-                    return true;
-            }
-
-            return false;
-        }
         private bool BotCanDoJob(BotSupervisorState state, BotJob job)
         {
+            var bot = state.Bot;
+            var orders = GetOrdersForBot(bot);
+
+            if (!IsJobAllowedByOrders(state, job, orders))
+                return false;
+
+            if (job.Type == JobType.ServiceMachine)
+            {
+                return BotHasMachineInput(bot, job);
+            }
+
+            if (job.Type == JobType.PlantCrop && !BotHasSeasonSafeSeed(bot))
+                return false;
+
             return job.Type switch
             {
-                JobType.TillSoil =>
-                    BotHasToolType(state.Bot, "Hoe"),
-
-                JobType.PlantCrop =>
-                    BotHasInventoryCategory(state.Bot, "Seed"),
-
-                JobType.WaterCrop =>
-                    BotHasToolType(state.Bot, "WateringCan"),
-
-                JobType.ServiceMachine =>
-                    BotCanServiceMachine(state, job),
-
-                JobType.MineBreakStone =>   
-                    BotHasToolType(state.Bot, "Pickaxe"),
-
+                JobType.HarvestCrop => BotHasToolType(bot, "Scythe") || BotHasInventoryCategory(bot, "Crop"),
+                JobType.ClearDeadCrop => BotHasToolType(bot, "Scythe"),
+                JobType.PlantCrop => BotHasInventoryCategory(bot, "Seed"),
+                JobType.WaterCrop => BotHasToolType(bot, "WateringCan"),
+                JobType.TillSoil => BotHasToolType(bot, "Hoe"),
+                JobType.MineBreakStone => BotHasToolType(bot, "Pickaxe"),
                 _ => true,
             };
         }
-        private bool BotCanServiceMachine(BotSupervisorState state, BotJob job)
+
+        private bool IsJobAllowedByOrders(BotSupervisorState state, BotJob job, BotOrders orders)
         {
-            var botName = state.Bot?.name ?? "";
-
-            // No machine role? Then this is a farm/general bot.
-            // It should not do machine jobs.
-            if (!TryGetAllowedMachinesForBot(botName, out var allowedMachines))
+            if (job == null || orders == null || orders.Mode != BotOrderMode.Work)
                 return false;
 
-            // Has a machine role, but not for this machine.
-            if (!allowedMachines.Contains(job.TargetName))
+            if (!IsJobInsideAllowedZones(state?.Bot?.currentLocation, job, orders))
                 return false;
 
-            // Has the role and the needed input.
-            return BotHasMachineInput(state.Bot, job);
+            return job.Type switch
+            {
+                JobType.HarvestCrop => (orders.Capabilities & BotCapability.Harvest) != 0,
+                JobType.WaterCrop => (orders.Capabilities & BotCapability.Water) != 0,
+                JobType.PlantCrop => (orders.Capabilities & BotCapability.Plant) != 0,
+                JobType.ClearDeadCrop => (orders.Capabilities & BotCapability.Clear) != 0,
+                JobType.ClearDebris => (orders.Capabilities & BotCapability.Clear) != 0,
+                JobType.TillSoil => (orders.Capabilities & BotCapability.Till) != 0
+                    || (state?.Bot?.currentLocation is MineShaft && (orders.Capabilities & BotCapability.Mine) != 0),
+                JobType.MineBreakStone => (orders.Capabilities & BotCapability.Mine) != 0,
+                JobType.MineCutWeeds => (orders.Capabilities & (BotCapability.Mine | BotCapability.Clear)) != 0,
+                JobType.ServiceMachine => IsMachineAllowedByOrders(job.TargetName, orders),
+                _ => false,
+            };
         }
+
+        private bool IsJobInsideAllowedZones(GameLocation location, BotJob job, BotOrders orders)
+        {
+            if (orders.AllowedZones.Count == 0)
+                return true;
+
+            if (location == null)
+                return false;
+
+            return orders.AllowedZones
+                .Select(zoneName => botZones.TryGetValue(zoneName, out var zone) ? zone : null)
+                .Where(zone => zone != null && string.Equals(zone.LocationName, location.NameOrUniqueName, StringComparison.Ordinal))
+                .Any(zone => zone.Bounds.Contains((int)job.TargetTile.X, (int)job.TargetTile.Y));
+        }
+
+        private static bool IsMachineAllowedByOrders(string machineName, BotOrders orders)
+        {
+            if ((orders.Capabilities & BotCapability.Machines) == 0)
+                return false;
+
+            return machineName switch
+            {
+                "Keg" => (orders.Capabilities & BotCapability.Kegs) != 0,
+                "Preserves Jar" => (orders.Capabilities & BotCapability.Jars) != 0,
+                "Seed Maker" => (orders.Capabilities & BotCapability.SeedMakers) != 0,
+                "Furnace" => (orders.Capabilities & BotCapability.Furnaces) != 0,
+                "Charcoal Kiln" => (orders.Capabilities & BotCapability.Furnaces) != 0,
+                _ => (orders.Capabilities & BotCapability.Machines) != 0,
+            };
+        }
+
         private bool BotHasMachineInput(BotObject bot, BotJob job)
         {
-            var botName = bot.name ?? "";
+            if (!IsMachineAllowedByOrders(job.TargetName, GetOrdersForBot(bot)))
+                return false;
 
-            if (TryGetAllowedMachinesForBot(botName, out var allowedMachines))
-            {
-                // Machine-limited bot can only service allowed machine names.
-                if (!allowedMachines.Contains(job.TargetName))
-                    return false;
-            }
             if (job.InputRules == null || job.InputRules.Count == 0)
                 return true;
 
@@ -924,6 +1790,57 @@ namespace Farmtronics {
             return false;
         }
 
+        private bool BotHasSeasonSafeSeed(BotObject bot)
+        {
+            if (bot?.farmer == null)
+                return false;
+
+            bool foundSeed = false;
+            foreach (Item item in bot.farmer.Items)
+            {
+                if (item == null || item.getCategoryName() != "Seed")
+                    continue;
+
+                foundSeed = true;
+                if (!CanSeedMatureThisSeason(item))
+                    return false;
+            }
+
+            return foundSeed;
+        }
+
+        private bool CanSeedMatureThisSeason(Item item)
+        {
+            if (item == null)
+                return false;
+
+            try
+            {
+                var crops = Game1.content.Load<Dictionary<string, StardewValley.GameData.Crops.CropData>>("Data/Crops");
+                string seedId = item.ItemId;
+                if (string.IsNullOrWhiteSpace(seedId) || !crops.TryGetValue(seedId, out var cropData) || cropData == null)
+                    return false;
+
+                if (cropData.Seasons != null
+                    && cropData.Seasons.Count > 0
+                    && !cropData.Seasons.Any(season => string.Equals(season.ToString(), Game1.currentSeason, StringComparison.OrdinalIgnoreCase)))
+                    return false;
+
+                int daysToMature = cropData.DaysInPhase?.Sum() ?? int.MaxValue;
+                int daysRemaining = 28 - Game1.dayOfMonth + 1;
+                return daysToMature <= daysRemaining;
+            }
+            catch (Exception ex)
+            {
+                LogOncePerInterval(
+                    "crop-data-read-failed",
+                    $"Planting safety: could not read crop data; refusing unknown seed maturity. {ex.Message}",
+                    LogLevel.Warn,
+                    TimeSpan.FromSeconds(30));
+                return false;
+            }
+        }
+
         private bool BotHasToolType(BotObject bot, string toolType)
         {
             if (bot?.farmer == null)
@@ -968,6 +1885,51 @@ namespace Farmtronics {
 			return true;
 		}
 
+        private static bool IsUnsafePlacedObject(GameLocation location, Vector2 tile)
+        {
+            if (location == null)
+                return true;
+
+            if (!location.objects.TryGetValue(tile, out StardewValley.Object obj) || obj == null)
+                return false;
+
+            if (obj is Chest || obj is BotObject)
+                return true;
+
+            if (obj.bigCraftable.Value)
+                return true;
+
+            return false;
+        }
+
+        private static bool IsExpectedMachine(GameLocation location, Vector2 tile, string expectedName)
+        {
+            if (location == null || string.IsNullOrWhiteSpace(expectedName))
+                return false;
+
+            if (!location.objects.TryGetValue(tile, out StardewValley.Object obj) || obj == null)
+                return false;
+
+            if (obj is Chest || obj is BotObject)
+                return false;
+
+            return obj.Name == expectedName && obj.bigCraftable.Value;
+        }
+
+        private static bool IsNamedObjectTile(GameLocation location, Vector2 tile, string expectedName)
+        {
+            if (location == null || string.IsNullOrWhiteSpace(expectedName))
+                return false;
+
+            if (!location.objects.TryGetValue(tile, out StardewValley.Object obj) || obj == null)
+                return false;
+
+            if (obj is Chest || obj is BotObject || obj.bigCraftable.Value)
+                return false;
+
+            return obj.Name == expectedName;
+        }
+
         static bool IsDryCropTile(GameLocation location, Vector2 tile) {
 			ValMap info = TileInfo.GetInfo(location, tile);
 			if (info == null) return false;
@@ -1008,18 +1970,6 @@ namespace Farmtronics {
             public string Name { get; init; }
             public string EndsWith { get; init; }
         }
-        private static readonly Dictionary<string, string> BotMachinePrefixes = new()
-        {
-            ["keg"] = "Keg",
-            ["jar"] = "Preserves Jar",
-            ["preserves"] = "Preserves Jar",
-            ["seed"] = "Seed Maker",
-            ["mayo"] = "Mayonnaise Machine",
-            ["mayonnaise"] = "Mayonnaise Machine",
-            ["cheese"] = "Cheese Press",
-            ["furnace"] = "Furnace",
-            ["kiln"] = "Charcoal Kiln"
-        };
 
         private static readonly List<MachineRule> machineRules = new()
         {
@@ -1029,9 +1979,10 @@ namespace Farmtronics {
                 BasePriority = 750,
                 InputRules =
                 {
-                    new MachineInputRule { Category = "Milk" },
                     new MachineInputRule { Name = "Milk" },
                     new MachineInputRule { Name = "Goat Milk" },
+                    new MachineInputRule { Name = "Large Milk" },
+                    new MachineInputRule { Name = "L. Goat Milk" },
                 }
             },
             new()
@@ -1040,6 +1991,7 @@ namespace Farmtronics {
                 BasePriority = 750,
                 InputRules =
                 {
+                    new MachineInputRule { Name = "Coffee Bean" },
                     new MachineInputRule { Category = "Fruit" },
                     new MachineInputRule { Name = "Hops" },
                     new MachineInputRule { Name = "Wheat" },
@@ -1131,7 +2083,7 @@ namespace Farmtronics {
             ModEntry.instance.Monitor.Log(
                 $"Supervisor job failed for {state.BotName}: {plan.JobType} at {(int)plan.TargetTile.X},{(int)plan.TargetTile.Y} name {plan.TargetName}; reason: {reason}");
 
-            state.CurrentPlan = null;
+            ClearCurrentPlan(state);
             state.Mode = BotMode.Planning;
         }
         private static bool IsReadyMachine(StardewValley.Object obj)
@@ -1146,15 +2098,15 @@ namespace Farmtronics {
                 && obj.MinutesUntilReady > 0
                 && !obj.readyForHarvest.Value;
         }
-        private bool TryBuildTillSoilJob(Farm farm, Vector2 tile, out BotJob job)
+        private bool TryBuildTillSoilJob(GameLocation location, Vector2 tile, out BotJob job, int basePriority = 1, string targetName = "Empty for Tilling")
         {
             job = null;
 
-            if (farm.objects.TryGetValue(tile, out StardewValley.Object obj))
+            if (location.objects.TryGetValue(tile, out StardewValley.Object obj))
                 return false;
 
             // Already has terrain feature.
-            if (farm.terrainFeatures.TryGetValue(tile, out var feature))
+            if (location.terrainFeatures.TryGetValue(tile, out var feature))
             {
                 // HoeDirt means already tilled.
                 if (feature is StardewValley.TerrainFeatures.HoeDirt)
@@ -1164,12 +2116,12 @@ namespace Farmtronics {
                 return false;
             }
 
-            var diggable = farm.doesTileHaveProperty((int)tile.X, (int)tile.Y, "Diggable", "Back");
+            var diggable = location.doesTileHaveProperty((int)tile.X, (int)tile.Y, "Diggable", "Back");
 
             if (diggable == null)
                 return false;
 
-            var adjacentTiles = GetAdjacentPassableTiles(farm, tile).ToList();
+            var adjacentTiles = GetAdjacentPassableTiles(location, tile).ToList();
             if (adjacentTiles.Count == 0)
             {
                 ModEntry.instance.Monitor.Log(
@@ -1180,27 +2132,27 @@ namespace Farmtronics {
             job = new BotJob
             {
                 Type = JobType.TillSoil,
-                JobKey = GetJobKey(farm, JobType.TillSoil, tile),
-                TargetName = "Empty for Tilling",
+                JobKey = GetJobKey(location, JobType.TillSoil, tile),
+                TargetName = targetName,
                 TargetTile = tile,
                 AdjacentTile = adjacentTiles.First(),
-                BasePriority = 1,
+                BasePriority = basePriority,
             };
 
             return true;
         }
-        private bool TryBuildMachineJob(Farm farm, Vector2 tile, TimeSpan now, out BotJob job)
+        private bool TryBuildMachineJob(GameLocation location, Vector2 tile, TimeSpan now, out BotJob job)
         {
             job = null;
 
-            if (!farm.objects.TryGetValue(tile, out StardewValley.Object obj))
+            if (!location.objects.TryGetValue(tile, out StardewValley.Object obj))
                 return false;
 
             // 1. Always allow ready machines through.
             // They have output waiting and should be harvested.
             if (IsReadyMachine(obj))
             {
-                return TryCreateMachineJobFromRule(farm, tile, obj, out job);
+                return TryCreateMachineJobFromRule(location, tile, obj, out job);
             }
 
             // 2. Skip machines that are clearly busy/running.
@@ -1227,9 +2179,9 @@ namespace Farmtronics {
                 return false;
             }
 
-            return TryCreateMachineJobFromRule(farm, tile, obj, out job);
+            return TryCreateMachineJobFromRule(location, tile, obj, out job);
         }
-        private bool TryCreateMachineJobFromRule(Farm farm, Vector2 tile, StardewValley.Object obj, out BotJob job)
+        private bool TryCreateMachineJobFromRule(GameLocation location, Vector2 tile, StardewValley.Object obj, out BotJob job)
         {
             job = null;
 
@@ -1254,7 +2206,7 @@ namespace Farmtronics {
                 return false;
             }
 
-            ValMap info = TileInfo.GetInfo(farm, tile);
+            ValMap info = TileInfo.GetInfo(location, tile);
 
             if (info == null)
                 return false;
@@ -1268,16 +2220,10 @@ namespace Farmtronics {
             var rule = machineRules.FirstOrDefault(r => r.MachineName == name);
             if (rule == null)
             {
-                // Temporary: log named objects that were not matched.
-                if (type == "Object" || type == "BigCraftable")
-                {
-                    ModEntry.instance.Monitor.Log(
-                        $"Machine scan no rule for tile {(int)tile.X},{(int)tile.Y}: type='{type}' name='{name}'");
-                }
                 return false;
             }
 
-            var adjacentTiles = GetAdjacentPassableTiles(farm, tile).ToList();
+            var adjacentTiles = GetAdjacentPassableTiles(location, tile).ToList();
             if (adjacentTiles.Count == 0)
             {
                 ModEntry.instance.Monitor.Log(
@@ -1290,7 +2236,7 @@ namespace Farmtronics {
             job = new BotJob
             {
                 Type = JobType.ServiceMachine,
-                JobKey = GetJobKey(farm, JobType.ServiceMachine, tile),
+                JobKey = GetJobKey(location, JobType.ServiceMachine, tile),
                 TargetName = name,
                 TargetTile = tile,
                 AdjacentTile = adjacentTile,
@@ -1355,10 +2301,24 @@ namespace Farmtronics {
 
             return false;
         }
-        private bool IsHarvestableCropTile(GameLocation location, Vector2 tile, out string harvestName, out bool requiresScythe)
+        private bool isClearDeadCropTile(GameLocation location, Vector2 tile) {
+            ValMap info = TileInfo.GetInfo(location, tile);
+      	    if (info == null) return false;
+
+            if (!info.map.TryGetValue(new ValString("crop"), out Value cropValue))
+                return false;
+
+            if (cropValue == null || cropValue is ValNull)
+                return false;
+
+            if (cropValue is not ValMap crop)
+                return false;
+
+            return crop.GetBool("dead");
+        }   
+        private bool IsHarvestableCropTile(GameLocation location, Vector2 tile, out string harvestName)
         {
             harvestName = null;
-            requiresScythe = false;
 
             ValMap info = TileInfo.GetInfo(location, tile);
             if (info == null) return false;
@@ -1378,18 +2338,13 @@ namespace Farmtronics {
             if (!crop.GetBool("harvestable"))
                 return false;
 
-            bool canUseHarvest = crop.GetBool("harvestMethod");
-            requiresScythe = !canUseHarvest
-            || (crop.GetInt("indexOfHarvest", 0) == 771)    // grass is weird and doesn't set harvestMethod but does require scythe
-            || (crop.GetInt("indexOfHarvest", 0) == 1279);  // mushroom grass also requires scythe without setting harvestMethod
-            harvestName = requiresScythe ? "Harvestable Crop (Scythe)" : "Harvestable Crop";
+            harvestName = info.GetString("name") ?? "Harvestable Crop";
             return true;
         }
 
-        private bool IsPlantCropTile(GameLocation location, Vector2 tile, out string plantName, out bool clearAhead, out bool canFertilize)
+        private bool IsPlantCropTile(GameLocation location, Vector2 tile, out string plantName, out bool canFertilize)
         {
             plantName = null;
-            clearAhead = false;
             canFertilize = false;
 
 			ValMap info = TileInfo.GetInfo(location, tile);
@@ -1399,20 +2354,15 @@ namespace Farmtronics {
 
             info.map.TryGetValue(new ValString("crop"), out Value cropValue);
 
-            if (cropValue is ValMap crop) {
-                if (crop.GetBool("dead")) {
-                    clearAhead = true;
-                } else {
-                    return false;
-                }
-            }
+            if (cropValue != null && cropValue is not ValNull)
+                return false;
 
             bool hasFertilizer = info.GetBool("hasFertilizer");
             bool isTilled = info.GetBool("tilled");
 
             canFertilize = !hasFertilizer && isTilled;
 
-            plantName = clearAhead ? "Plantable Crop (Clear Ahead)" : "Plantable Crop";
+            plantName = "Plantable Crop";
 
             return true;
         }
@@ -1425,7 +2375,7 @@ namespace Farmtronics {
             if (plan.JobType == JobType.ServiceMachine)
                 {
                     MarkMachineServiced(bot.TileLocation, bot.currentLocation as Farm );
-                    state.CurrentPlan = null;
+                    ClearCurrentPlan(state);
                     state.Mode = BotMode.Planning;
                     return false;
                 }
@@ -1435,8 +2385,9 @@ namespace Farmtronics {
                 JobType.TillSoil => IsStillTillable(bot.currentLocation, plan.TargetTile),
                 JobType.ClearDebris => IsClearableTile(bot.currentLocation, plan.TargetTile, out _),
                 JobType.WaterCrop => IsDryCropTile(bot.currentLocation, plan.TargetTile),
-                JobType.HarvestCrop => IsHarvestableCropTile(bot.currentLocation, plan.TargetTile, out _, out _),
-                JobType.PlantCrop => IsPlantCropTile(bot.currentLocation, plan.TargetTile, out _, out _, out  _),
+                JobType.HarvestCrop => IsHarvestableCropTile(bot.currentLocation, plan.TargetTile, out _),
+                JobType.PlantCrop => IsPlantCropTile(bot.currentLocation, plan.TargetTile, out _, out  _),
+                JobType.ClearDeadCrop => isClearDeadCropTile(bot.currentLocation, plan.TargetTile), 
                 _ => false,
             };
         }
@@ -1594,6 +2545,7 @@ namespace Farmtronics {
             AppendTurns(lines, ref facing, finalFacing);
 
             AddPositionCheck(lines, current);
+            AddAheadSafetyCheck(lines, job);
             AddJobAction(lines, job);
 
             AddScriptFooter(lines);
@@ -1696,7 +2648,7 @@ private static void AddClearDebrisAction(List<string> lines)
     AddLines(lines,
         "    print \"Clearing tile\"",
         "    me.clearAhead",
-        "    wait 0",
+        "    wait .1",
         "    return true"
     );
 }
@@ -1708,7 +2660,7 @@ private static void AddHarvestCropAction(List<string> lines, BotJob job)
             "    print \"Harvesting crop with scythe\"",
             "    me.select 4",
             "    me.useTool",
-            "    wait 0",
+            "    wait .1",
             "    return true"
         );
     }
@@ -1716,8 +2668,15 @@ private static void AddHarvestCropAction(List<string> lines, BotJob job)
     {
         AddLines(lines,
             "    print \"Harvesting crop normally\"",
+            "    if me.ahead and me.ahead.name then",
+            "        crop_name = me.ahead.name",
+            "    end if",
             "    me.harvest",
-            "    wait 0",
+            "    wait .1",
+            "    if me.ahead and me.ahead.name == crop_name then",
+            "      me.select 4",
+            "      me.useTool",
+            "    end if",   
             "    return true"
         );
     }
@@ -1726,11 +2685,20 @@ private static void AddPlantCropAction(List<string> lines, BotJob job)
 {
     AddLines(lines,
         "    print \"Planting crop\"",
-        "    if selectInventoryByCategory(\"Fertilizer\") then me.placeItem",
         "    seedName = selectInventoryByCategory(\"Seed\")",
         "    trellised = [\"Hops Starter\",\"Grape Starter\",\"Bean Starter\"]",
         "    if not seedName then",
         "        print \"No seeds\"",
+        "        return false",
+        "    end if"
+    );
+
+    if (job.CanFertilize)
+        lines.Add("    if selectInventoryByCategory(\"Fertilizer\") then me.placeItem");
+
+    AddLines(lines,
+        "    if not selectInventoryByName(seedName) then",
+        "        print \"Seed disappeared before planting\"",
         "        return false",
         "    end if",
         "    if(trellised.hasIndex(seedName)) then",
@@ -1741,7 +2709,7 @@ private static void AddPlantCropAction(List<string> lines, BotJob job)
         "       end if",
         "    end if",
         "    me.placeItem",
-        "    wait 0",
+        "    wait .1",
         "    return true"
     );
 }
@@ -1766,6 +2734,18 @@ private static readonly Dictionary<string, HashSet<string>> BotMachineRoles =
 
     ["preserves"] = new()
     {
+        "Preserves Jar"
+    },
+
+    ["starfruit"] = new()
+    {
+        "Keg",
+        "Preserves Jar"
+    },
+
+    ["fruit"] = new()
+    {
+        "Keg",
         "Preserves Jar"
     },
 
@@ -1829,6 +2809,24 @@ private static bool TryGetAllowedMachinesForBot(
 
     return false;
 }
+
+private static bool IsMachineBotFor(
+    string botName,
+    string machineName)
+{
+    if (string.IsNullOrWhiteSpace(botName))
+        return false;
+
+    var normalized = botName.Trim().ToLowerInvariant();
+
+
+    if (normalized.StartsWith(machineName, StringComparison.OrdinalIgnoreCase))
+    {
+        return true;
+    }
+
+    return false;
+}
 private static void AddServiceMachineAction(List<string> lines, BotJob job)
 {
     lines.Add($"    print \"Servicing machine: {job.TargetName}\"");
@@ -1876,6 +2874,79 @@ private static void AddServiceMachineAction(List<string> lines, BotJob job)
 private static string EscapeMiniScript(string text)
 {
     return (text ?? "").Replace("\"", "\"\"");
+}
+
+private static void AddAheadSafetyCheck(List<string> lines, BotJob job)
+{
+    string expected = EscapeMiniScript(job.TargetName);
+
+    AddLines(lines,
+        "    ahead = me.ahead",
+        "    if ahead and ahead.hasIndex(\"name\") and (ahead.name == \"Bot\" or ahead.name == \"Farmtronics Bot\") then",
+        "        print \"Safety refused: bot ahead\"",
+        "        return false",
+        "    end if",
+        "    if ahead and ahead.hasIndex(\"type\") and ahead.type == \"Crafting\" and (not ahead.hasIndex(\"name\") or ahead.name != \"" + expected + "\") then",
+        "        print \"Safety refused: protected placed object ahead\"",
+        "        return false",
+        "    end if"
+    );
+
+    switch (job.Type)
+    {
+        case JobType.ClearDebris:
+        case JobType.MineBreakStone:
+        case JobType.MineCutWeeds:
+            AddLines(lines,
+                "    if not ahead then",
+                "        print \"Safety refused: no target ahead\"",
+                "        return false",
+                "    end if",
+                $"    if (not ahead.hasIndex(\"name\") or ahead.name != \"{expected}\") and (not ahead.hasIndex(\"type\") or ahead.type != \"{expected}\") then",
+                "        print \"Safety refused: clear target changed\"",
+                "        return false",
+                "    end if"
+            );
+            break;
+
+        case JobType.ClearDeadCrop:
+            AddLines(lines,
+                "    if not ahead or not ahead.hasIndex(\"crop\") or not ahead.crop or not ahead.crop.dead then",
+                "        print \"Safety refused: dead crop target changed\"",
+                "        return false",
+                "    end if"
+            );
+            break;
+
+        case JobType.HarvestCrop:
+        case JobType.WaterCrop:
+            AddLines(lines,
+                "    if not ahead or not ahead.hasIndex(\"crop\") or not ahead.crop then",
+                "        print \"Safety refused: crop target changed\"",
+                "        return false",
+                "    end if"
+            );
+            break;
+
+        case JobType.PlantCrop:
+        case JobType.TillSoil:
+            AddLines(lines,
+                "    if ahead and ahead.hasIndex(\"type\") and ahead.type != \"unknown\" and ahead.type != \"HoeDirt\" then",
+                "        print \"Safety refused: ground target is occupied\"",
+                "        return false",
+                "    end if"
+            );
+            break;
+
+        case JobType.ServiceMachine:
+            AddLines(lines,
+                $"    if not ahead or not ahead.hasIndex(\"name\") or ahead.name != \"{expected}\" then",
+                "        print \"Safety refused: machine target changed\"",
+                "        return false",
+                "    end if"
+            );
+            break;
+    }
 }
 
 private static void AddTillSoilAction(List<string> lines, BotJob job)
@@ -1936,6 +3007,10 @@ private static void AddScriptFooter(List<string> lines)
             switch (job.Type)
             {
                 case JobType.HarvestCrop:
+                    AddHarvestCropAction(lines, job);
+                    break;
+
+                case JobType.ClearDeadCrop:// force scythe for dead crops to avoid accidentally harvesting live ones
                     AddHarvestCropAction(lines, job);
                     break;
 
@@ -2095,6 +3170,831 @@ private static void AddScriptFooter(List<string> lines)
                 _ => tile
             };
         }
+
+        private bool LogOncePerInterval(string key, string message, LogLevel level, TimeSpan interval)
+        {
+            var now = Game1.currentGameTime?.TotalGameTime ?? TimeSpan.FromTicks(DateTime.UtcNow.Ticks);
+            if (rateLimitedLogTimes.TryGetValue(key, out var lastLogged) && now - lastLogged < interval)
+                return false;
+
+            rateLimitedLogTimes[key] = now;
+            ModEntry.instance.Monitor.Log(message, level);
+            return true;
+        }
+
+        public void ValidateBotPersistence()
+        {
+            AssignMissingBotIdentities();
+            var physicalBots = ScanWorldForBotObjects();
+            DetectDuplicateBotNames(physicalBots);
+            RescueMissingBots(physicalBots);
+            RegisterUntrackedWorldBots(physicalBots);
+            SeparateOverlappingBots();
+            SafeCleanupDuplicateBots(dryRun: false, automatic: true);
+        }
+
+        private void AssignMissingBotIdentities()
+        {
+            foreach (var snapshot in BuildBotSnapshots(validateFirst: false))
+            {
+                _ = snapshot.Bot.BotGuid;
+                _ = snapshot.Bot.CreatedTick;
+                snapshot.Bot.data.Update();
+            }
+        }
+
+        private List<BotWorldEntry> ScanWorldForBotObjects()
+        {
+            var result = new List<BotWorldEntry>();
+            if (!Context.IsWorldReady)
+                return result;
+
+            foreach (var location in GetLocationsForBotScan())
+            {
+                foreach (var pair in location.objects.Pairs)
+                {
+                    if (pair.Value is BotObject bot)
+                        result.Add(new BotWorldEntry(bot, location, pair.Key));
+                }
+            }
+
+            return result;
+        }
+
+        private List<GameLocation> GetLocationsForBotScan()
+        {
+            var locations = new List<GameLocation>();
+            void AddLocation(GameLocation location)
+            {
+                if (location == null)
+                    return;
+
+                if (!locations.Any(existing => ReferenceEquals(existing, location)))
+                    locations.Add(location);
+            }
+
+            foreach (var location in Game1.locations)
+                AddLocation(location);
+
+            AddLocation(Game1.player?.currentLocation);
+
+            foreach (var bot in BotManager.GetAllBots().Where(bot => bot != null))
+                AddLocation(bot.currentLocation);
+
+            return locations;
+        }
+
+        private List<BotStoredEntry> ScanStoredBotObjects()
+        {
+            var result = new List<BotStoredEntry>();
+            if (!Context.IsWorldReady)
+                return result;
+
+            AddStoredBotsFromItems(Game1.player.Items, "player inventory", result);
+            if (Game1.player.recoveredItem is BotObject recoveredBot)
+                result.Add(new BotStoredEntry(recoveredBot, "player recoveredItem"));
+
+            foreach (var location in GetLocationsForBotScan())
+            {
+                foreach (var pair in location.objects.Pairs)
+                {
+                    if (pair.Value is Chest chest)
+                        AddStoredBotsFromItems(chest.Items, $"chest {location.NameOrUniqueName} {pair.Key.X},{pair.Key.Y}", result);
+                    else if (pair.Value is BotObject bot)
+                        AddStoredBotsFromItems(bot.inventory, $"bot inventory {bot.name}", result);
+                }
+            }
+
+            return result;
+        }
+
+        private static void AddStoredBotsFromItems(IList<Item> items, string container, List<BotStoredEntry> result)
+        {
+            if (items == null)
+                return;
+
+            foreach (var item in items)
+            {
+                if (item is BotObject bot)
+                    result.Add(new BotStoredEntry(bot, container));
+            }
+        }
+
+        private List<BotSnapshot> BuildBotSnapshots(bool validateFirst = true)
+        {
+            if (validateFirst)
+                AssignMissingBotIdentities();
+
+            var physicalBots = ScanWorldForBotObjects();
+            var storedBots = ScanStoredBotObjects();
+            var trackedBots = BotManager.GetAllBots().Where(bot => bot != null).ToList();
+            var allBots = trackedBots
+                .Concat(physicalBots.Select(entry => entry.Bot))
+                .Concat(storedBots.Select(entry => entry.Bot))
+                .Where(bot => bot != null)
+                .Distinct<BotObject>(ReferenceEqualityComparer.Instance)
+                .ToList();
+
+            var snapshots = new List<BotSnapshot>();
+            foreach (var bot in allBots)
+            {
+                var physical = physicalBots.FirstOrDefault(entry => ReferenceEquals(entry.Bot, bot));
+                var stored = storedBots.FirstOrDefault(entry => ReferenceEquals(entry.Bot, bot));
+                bool tracked = trackedBots.Any(trackedBot => ReferenceEquals(trackedBot, bot));
+                bool placed = physical != null;
+                bool storedInContainer = stored != null;
+                bool inSupervisorState = botStates.Values.Any(state => ReferenceEquals(state.Bot, bot));
+                snapshots.Add(new BotSnapshot(
+                    bot,
+                    "Unclassified",
+                    physical?.Location,
+                    physical?.Tile ?? bot.TileLocation,
+                    stored?.Container,
+                    tracked,
+                    placed,
+                    storedInContainer,
+                    inSupervisorState));
+            }
+
+            MarkKnownCanonicals(snapshots);
+            return snapshots
+                .Select(snapshot => snapshot with { Classification = ClassifyBotSnapshot(snapshot, snapshots) })
+                .ToList();
+        }
+
+        private string ClassifyBotSnapshot(BotSnapshot snapshot, List<BotSnapshot> allSnapshots)
+        {
+            if (snapshot == null)
+                return "UnknownBot";
+
+            if (snapshot.IsStored)
+                return "StoredBot";
+
+            bool hasSameNameDuplicates = allSnapshots.Any(other =>
+                !ReferenceEquals(other.Bot, snapshot.Bot)
+                && string.Equals(other.Bot.name, snapshot.Bot.name, StringComparison.OrdinalIgnoreCase));
+
+            var canonical = hasSameNameDuplicates
+                ? ChooseCanonicalBot(allSnapshots
+                    .Where(other => string.Equals(other.Bot.name, snapshot.Bot.name, StringComparison.OrdinalIgnoreCase))
+                    .ToList())
+                : snapshot;
+
+            bool isCanonical = canonical != null && ReferenceEquals(canonical.Bot, snapshot.Bot);
+
+            if (snapshot.Bot.IsQuarantined && hasSameNameDuplicates && !isCanonical)
+                return "QuarantinedDuplicate";
+
+            if (IsBrickedDuplicate(snapshot, canonical, allSnapshots))
+                return "BrickedDuplicate";
+
+            if (snapshot.IsPlaced && !snapshot.IsTracked)
+                return "PlacedButNotRegistered";
+
+            if (!snapshot.IsPlaced && snapshot.IsTracked)
+                return "RegisteredGhost";
+
+            if (IsFunctionalWorldBotSnapshot(snapshot, isCanonical))
+                return "FunctionalWorldBot";
+
+            if (snapshot.Bot.IsQuarantined)
+                return "QuarantinedDuplicate";
+
+            return "UnknownBot";
+        }
+
+        private bool IsFunctionalWorldBotSnapshot(BotSnapshot snapshot, bool isCanonical)
+        {
+            return snapshot != null
+                && isCanonical
+                && snapshot.IsPlaced
+                && snapshot.IsTracked
+                && !snapshot.IsStored
+                && !snapshot.Bot.IsQuarantined
+                && snapshot.Bot.shell != null;
+        }
+
+        private void MarkKnownCanonicals(List<BotSnapshot> snapshots)
+        {
+            foreach (var snapshot in snapshots.Where(snapshot => snapshot.IsPlaced && !string.IsNullOrWhiteSpace(snapshot.Bot.BotGuid)))
+                knownCanonicalByGuid[snapshot.Bot.BotGuid] = snapshot.Bot;
+        }
+
+        private void DetectDuplicateBotNames(List<BotWorldEntry> physicalBots)
+        {
+            foreach (var group in BotManager.GetAllBots()
+                .Concat(physicalBots.Select(entry => entry.Bot))
+                .Where(bot => bot != null)
+                .GroupBy(bot => bot.name ?? bot.Name ?? "(unnamed)", StringComparer.OrdinalIgnoreCase)
+                .Where(group => group.Select(bot => bot).Distinct<BotObject>(ReferenceEqualityComparer.Instance).Count() > 1))
+            {
+                LogOncePerInterval(
+                    $"duplicate-name:{group.Key}",
+                    $"Bot persistence WARN: duplicate bot name '{group.Key}' count={group.Select(bot => bot).Distinct<BotObject>(ReferenceEqualityComparer.Instance).Count()}.",
+                    LogLevel.Warn,
+                    TimeSpan.FromSeconds(30));
+            }
+        }
+
+        private void RescueMissingBots(List<BotWorldEntry> physicalBots)
+        {
+            var physicallyPresent = new HashSet<BotObject>(
+                physicalBots.Select(entry => entry.Bot),
+                ReferenceEqualityComparer.Instance);
+            var snapshots = BuildBotSnapshots(validateFirst: false);
+
+            foreach (var bot in BotManager.GetAllBots().ToList())
+            {
+                if (bot == null)
+                    continue;
+
+                var location = GetPreferredRescueLocation(bot) ?? bot.currentLocation ?? Game1.player?.currentLocation;
+                if (location == null)
+                    continue;
+
+                if (physicallyPresent.Contains(bot))
+                    continue;
+
+                var snapshot = snapshots.FirstOrDefault(snapshot => ReferenceEquals(snapshot.Bot, bot));
+                if (snapshot?.IsStored == true)
+                {
+                    LogOncePerInterval(
+                        $"tracked-stored:{bot.BotGuid}",
+                        $"Bot persistence WARN: tracked bot {bot.name} guid={bot.BotGuid} is stored in {snapshot.Container}; not rescuing it into the world.",
+                        LogLevel.Warn,
+                        TimeSpan.FromSeconds(30));
+                    continue;
+                }
+
+                var placedCanonical = snapshots.FirstOrDefault(snapshot =>
+                    snapshot.IsPlaced
+                    && !ReferenceEquals(snapshot.Bot, bot)
+                    && (
+                        string.Equals(snapshot.Bot.BotGuid, bot.BotGuid, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals(snapshot.Bot.name, bot.name, StringComparison.OrdinalIgnoreCase)
+                    ));
+                if (placedCanonical != null)
+                {
+                    LogOncePerInterval(
+                        $"registered-ghost:{bot.BotGuid}:{placedCanonical.Bot.BotGuid}",
+                        $"Bot persistence WARN: registered ghost {bot.name} guid={bot.BotGuid} has placed canonical candidate {placedCanonical.Bot.name} guid={placedCanonical.Bot.BotGuid}; not rescuing duplicate.",
+                        LogLevel.Warn,
+                        TimeSpan.FromSeconds(30));
+                    if (!HasValuableInventory(bot))
+                        RemoveBotFromRegistries(bot);
+                    else
+                        QuarantineBot(bot, "Registered-but-not-placed duplicate with valuable inventory.");
+                    continue;
+                }
+
+                LogOncePerInterval(
+                    $"tracked-missing:{bot.BotGuid}",
+                    $"Bot persistence WARN: tracked bot missing from location.objects: {bot.name} loc={location.NameOrUniqueName} tile={bot.TileLocation.X},{bot.TileLocation.Y}. Rescuing.",
+                    LogLevel.Warn,
+                    TimeSpan.FromSeconds(10));
+                EnsureBotPlacedSafely(bot, location, GetPreferredRescueTile(bot));
+            }
+        }
+
+        private void RegisterUntrackedWorldBots(List<BotWorldEntry> physicalBots)
+        {
+            var tracked = new HashSet<BotObject>(BotManager.GetAllBots(), ReferenceEqualityComparer.Instance);
+
+            foreach (var entry in physicalBots)
+            {
+                var bot = entry.Bot;
+                if (bot == null || tracked.Contains(bot))
+                    continue;
+
+                LogOncePerInterval(
+                    $"placed-not-registered:{bot.BotGuid}",
+                    $"Bot persistence WARN: physical bot not tracked: {bot.name} loc={entry.Location.NameOrUniqueName} tile={entry.Tile.X},{entry.Tile.Y}. Re-registering.",
+                    LogLevel.Warn,
+                    TimeSpan.FromSeconds(30));
+
+                if (bot.owner.Value == Game1.player.UniqueMultiplayerID)
+                {
+                    BotManager.RegisterLocalBot(bot, "world scan re-register");
+                }
+                else
+                {
+                    if (!BotManager.remoteInstances.TryGetValue(bot.owner.Value, out var remoteBots))
+                    {
+                        remoteBots = new List<BotObject>();
+                        BotManager.remoteInstances[bot.owner.Value] = remoteBots;
+                    }
+                    remoteBots.Add(bot);
+                }
+
+                bot.currentLocation = entry.Location;
+                bot.TileLocation = entry.Tile;
+                bot.Position = entry.Tile.GetAbsolutePosition();
+                bot.data.Update();
+                tracked.Add(bot);
+            }
+        }
+
+        private Vector2 GetPreferredRescueTile(BotObject bot)
+        {
+            if (bot == null)
+                return Game1.player?.Tile ?? Vector2.Zero;
+
+            if (namedHomeTiles.TryGetValue(bot.name ?? "", out var homeTile))
+                return homeTile;
+
+            return bot.TileLocation != Vector2.Zero ? bot.TileLocation : (Game1.player?.Tile ?? Vector2.Zero);
+        }
+
+        private GameLocation GetPreferredRescueLocation(BotObject bot)
+        {
+            if (bot != null && namedHomeTiles.ContainsKey(bot.name ?? ""))
+                return Game1.getLocationFromName("Farm") ?? bot.currentLocation;
+
+            return bot?.currentLocation;
+        }
+
+        private void SeparateOverlappingBots()
+        {
+            foreach (var group in ScanWorldForBotObjects()
+                .GroupBy(entry => $"{entry.Location.NameOrUniqueName}:{entry.Tile.X},{entry.Tile.Y}")
+                .Where(group => group.Select(entry => entry.Bot).Distinct<BotObject>(ReferenceEqualityComparer.Instance).Count() > 1))
+            {
+                var entries = group
+                    .GroupBy(entry => entry.Bot, ReferenceEqualityComparer.Instance)
+                    .Select(botGroup => botGroup.First())
+                    .ToList();
+
+                var keeper = entries.First();
+                LogOncePerInterval(
+                    $"overlap:{keeper.Location.NameOrUniqueName}:{keeper.Tile.X},{keeper.Tile.Y}",
+                    $"Bot persistence WARN: overlapping bots at {keeper.Location.NameOrUniqueName} {keeper.Tile.X},{keeper.Tile.Y}: {string.Join(", ", entries.Select(entry => entry.Bot.name))}.",
+                    LogLevel.Warn,
+                    TimeSpan.FromSeconds(10));
+
+                foreach (var entry in entries.Skip(1))
+                {
+                    ClearBotScriptQueue(entry.Bot);
+                    CancelSupervisorPlan(entry.Bot);
+                    EnsureBotPlacedSafely(entry.Bot, entry.Location, GetPreferredRescueTile(entry.Bot));
+                }
+            }
+        }
+
+        private void CancelSupervisorPlan(BotObject bot)
+        {
+            var state = botStates.Values.FirstOrDefault(state => ReferenceEquals(state.Bot, bot));
+            if (state == null)
+                return;
+
+            ClearCurrentPlan(state);
+            state.Mode = BotMode.Cooldown;
+            state.NextAllowedPlanAt = Game1.currentGameTime.TotalGameTime + TimeSpan.FromSeconds(2);
+            state.LastNoPlanReason = "Bot persistence safety intervention.";
+        }
+
+        private bool EnsureBotPlacedSafely(BotObject bot, GameLocation location, Vector2 preferredTile)
+        {
+            if (bot == null || location == null)
+                return false;
+
+            if (!TryFindSafeBotTile(bot, location, preferredTile, out var safeTile))
+            {
+                LogOncePerInterval(
+                    $"no-safe-tile:{bot.BotGuid}:{location.NameOrUniqueName}",
+                    $"Bot persistence WARN: no safe tile found for {bot.name} near {location.NameOrUniqueName} {preferredTile.X},{preferredTile.Y}; bot remains tracked and disabled.",
+                    LogLevel.Warn,
+                    TimeSpan.FromSeconds(30));
+                QuarantineBot(bot, "No safe tile found for placement.");
+                return false;
+            }
+
+            RemoveBotFromWorld(bot);
+            bot.currentLocation = location;
+            bot.TileLocation = safeTile;
+            bot.Position = safeTile.GetAbsolutePosition();
+            ClearBotQuarantine(bot, "safe placement");
+            bot.data.Update();
+            location.objects[safeTile] = bot;
+
+            ModEntry.instance.Monitor.Log(
+                $"Bot persistence WARN: placed/reinserted {bot.name} at {location.NameOrUniqueName} {safeTile.X},{safeTile.Y}.",
+                LogLevel.Warn);
+            ReportBotInventory(bot);
+            return true;
+        }
+
+        private bool TryFindSafeBotTile(BotObject bot, GameLocation location, Vector2 preferredTile, out Vector2 safeTile)
+        {
+            if (IsTileSafeForBot(bot, location, preferredTile))
+            {
+                safeTile = preferredTile;
+                return true;
+            }
+
+            for (int radius = 1; radius <= 12; radius++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    for (int dy = -radius; dy <= radius; dy++)
+                    {
+                        if (Math.Abs(dx) != radius && Math.Abs(dy) != radius)
+                            continue;
+
+                        var candidate = preferredTile + new Vector2(dx, dy);
+                        if (IsTileSafeForBot(bot, location, candidate))
+                        {
+                            safeTile = candidate;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            safeTile = Vector2.Zero;
+            return false;
+        }
+
+        private bool IsTileOccupiedByAnotherBot(BotObject bot, GameLocation location, Vector2 tile)
+        {
+            return location != null
+                && location.objects.TryGetValue(tile, out StardewValley.Object obj)
+                && obj is BotObject
+                && !ReferenceEquals(obj, bot);
+        }
+
+        private bool IsTileSafeForBot(BotObject bot, GameLocation location, Vector2 tile)
+        {
+            if (location == null || !IsWithinMap(location, tile))
+                return false;
+
+            if (IsTileReservedByOther(bot, location, tile))
+                return false;
+
+            if (location.objects.TryGetValue(tile, out StardewValley.Object obj) && !ReferenceEquals(obj, bot))
+                return false;
+
+            if (location.objects.TryGetValue(tile, out obj) && ReferenceEquals(obj, bot))
+                return true;
+
+            if (IsTileOccupiedByAnotherBot(bot, location, tile))
+                return false;
+
+            return IsSupervisorPassable(location, tile);
+        }
+
+        private void QuarantineBot(BotObject bot, string reason)
+        {
+            if (bot == null)
+                return;
+
+            bool wasAlreadyQuarantined = bot.IsQuarantined;
+            ClearBotScriptQueue(bot);
+            CancelSupervisorPlan(bot);
+            bot.IsQuarantined = true;
+            bot.modData[ModEntry.GetModDataKey("quarantined")] = reason;
+            var physical = ScanWorldForBotObjects().FirstOrDefault(entry => ReferenceEquals(entry.Bot, bot));
+            if (physical != null && TryFindSafeBotTile(bot, physical.Location, physical.Tile + new Vector2(0, 1), out var quarantineTile))
+            {
+                RemoveBotFromWorld(bot);
+                bot.currentLocation = physical.Location;
+                bot.TileLocation = quarantineTile;
+                bot.Position = quarantineTile.GetAbsolutePosition();
+                bot.data.Update();
+                physical.Location.objects[quarantineTile] = bot;
+            }
+            string message = $"Bot persistence WARN: quarantined {bot.name}; guid={bot.BotGuid}; reason={reason}; loc={bot.currentLocation?.NameOrUniqueName ?? "(null)"} tile={bot.TileLocation.X},{bot.TileLocation.Y}.";
+            if (!wasAlreadyQuarantined)
+            {
+                ModEntry.instance.Monitor.Log(message, LogLevel.Warn);
+                ReportBotInventory(bot);
+            }
+            else
+            {
+                LogOncePerInterval($"quarantined:{bot.BotGuid}:{reason}", message, LogLevel.Warn, TimeSpan.FromSeconds(30));
+            }
+        }
+
+        private void ClearBotQuarantine(BotObject bot, string reason)
+        {
+            if (bot == null || !bot.IsQuarantined)
+                return;
+
+            bot.IsQuarantined = false;
+            bot.modData.Remove(ModEntry.GetModDataKey("quarantined"));
+            ModEntry.instance.Monitor.Log(
+                $"Bot persistence: cleared quarantine for {bot.name}; guid={bot.BotGuid}; reason={reason}.",
+                LogLevel.Warn);
+        }
+
+        public void SafeCleanupDuplicateBots(bool dryRun, bool automatic = false)
+        {
+            var snapshots = BuildBotSnapshots(validateFirst: false);
+            var summary = new DedupeSummary
+            {
+                RemainingUnknownBots = snapshots.Count(snapshot => snapshot.Classification == "UnknownBot")
+            };
+
+            foreach (var group in snapshots
+                .Where(snapshot => snapshot.Bot != null)
+                .GroupBy(snapshot => snapshot.Bot.name ?? snapshot.Bot.Name ?? "(unnamed)", StringComparer.OrdinalIgnoreCase)
+                .Where(group => group.Count() > 1))
+            {
+                CleanupDuplicateGroup(group.ToList(), "name", dryRun, automatic, summary);
+            }
+
+            foreach (var group in snapshots
+                .Where(snapshot => snapshot.Bot != null && !string.IsNullOrWhiteSpace(snapshot.Bot.BotGuid))
+                .GroupBy(snapshot => snapshot.Bot.BotGuid, StringComparer.OrdinalIgnoreCase)
+                .Where(group => group.Count() > 1))
+            {
+                string message = $"Bot dedupe {(dryRun ? "DRYRUN " : "")}guid duplicate report only: guid={group.Key} count={group.Count()} canonical={DescribeBotSnapshot(ChooseCanonicalBot(group.ToList()))}";
+                if (automatic)
+                    LogOncePerInterval($"dedupe-guid:{group.Key}", message, LogLevel.Warn, TimeSpan.FromSeconds(30));
+                else
+                    ModEntry.instance.Monitor.Log(message, LogLevel.Warn);
+            }
+
+            if (!automatic)
+            {
+                if (!dryRun)
+                    summary.RemainingUnknownBots = BuildBotSnapshots(validateFirst: false)
+                        .Count(snapshot => snapshot.Classification == "UnknownBot");
+
+                ModEntry.instance.Monitor.Log(
+                    $"Bot dedupe summary: {(dryRun ? "would delete" : "deleted")} BrickedDuplicate count={summary.DeletedBrickedDuplicates}; " +
+                    $"quarantined duplicate count={summary.QuarantinedDuplicates}; " +
+                    $"skipped valuable duplicate count={summary.SkippedValuableDuplicates}; " +
+                    $"remaining UnknownBot count={summary.RemainingUnknownBots}.",
+                    LogLevel.Warn);
+            }
+        }
+
+        private void CleanupDuplicateGroup(List<BotSnapshot> group, string duplicateKind, bool dryRun, bool automatic, DedupeSummary summary)
+        {
+            var canonical = ChooseCanonicalBot(group);
+            if (canonical == null)
+                return;
+
+            string canonicalMessage = $"Bot dedupe {(dryRun ? "DRYRUN " : "")}{duplicateKind}: canonical {DescribeBotSnapshot(canonical)}";
+            if (automatic)
+                LogOncePerInterval($"dedupe-canonical:{duplicateKind}:{canonical.Bot.name}", canonicalMessage, LogLevel.Warn, TimeSpan.FromSeconds(30));
+            else
+                ModEntry.instance.Monitor.Log(canonicalMessage, LogLevel.Warn);
+
+            foreach (var duplicate in group.Where(snapshot => !ReferenceEquals(snapshot.Bot, canonical.Bot)))
+            {
+                bool safeDelete = IsSafeDuplicateDelete(duplicate, canonical, group);
+                if (safeDelete)
+                {
+                    string deleteMessage = $"Bot dedupe {(dryRun ? "DRYRUN would remove" : "removing")} BrickedDuplicate: {DescribeBotSnapshot(duplicate)}";
+                    if (automatic)
+                        LogOncePerInterval($"dedupe-bricked:{duplicate.Bot.BotGuid}", deleteMessage, LogLevel.Warn, TimeSpan.FromSeconds(30));
+                    else
+                        ModEntry.instance.Monitor.Log(deleteMessage, LogLevel.Warn);
+                    summary.DeletedBrickedDuplicates++;
+                    if (!dryRun)
+                        DeleteBrickedDuplicate(duplicate.Bot);
+                    continue;
+                }
+
+                string quarantineReason = GetDuplicateQuarantineReason(duplicate, canonical, group);
+                if (quarantineReason == "valuable inventory")
+                    summary.SkippedValuableDuplicates++;
+                summary.QuarantinedDuplicates++;
+
+                string quarantineMessage = $"Bot dedupe {(dryRun ? "DRYRUN would quarantine" : "quarantining")} duplicate reason={quarantineReason}: {DescribeBotSnapshot(duplicate)}";
+                if (automatic)
+                    LogOncePerInterval($"dedupe-ambiguous:{duplicate.Bot.BotGuid}", quarantineMessage, LogLevel.Warn, TimeSpan.FromSeconds(30));
+                else
+                    ModEntry.instance.Monitor.Log(quarantineMessage, LogLevel.Warn);
+                if (!automatic)
+                    ReportBotInventory(duplicate.Bot);
+                if (!dryRun && !automatic)
+                    QuarantineBot(duplicate.Bot, $"Duplicate {duplicateKind} not deleted: {quarantineReason}; canonical guid={canonical.Bot.BotGuid}.");
+            }
+        }
+
+        private BotSnapshot ChooseCanonicalBot(List<BotSnapshot> candidates)
+        {
+            return candidates
+                .OrderByDescending(snapshot => HasValuableInventory(snapshot.Bot) ? 100000 : 0)
+                .ThenByDescending(snapshot => snapshot.IsPlaced ? 10000 : 0)
+                .ThenByDescending(snapshot => snapshot.InSupervisorState ? 5000 : 0)
+                .ThenByDescending(snapshot => snapshot.IsTracked ? 2500 : 0)
+                .ThenByDescending(snapshot => snapshot.Bot.shell != null ? 1500 : 0)
+                .ThenBy(snapshot => snapshot.Bot.IsQuarantined ? 1 : 0)
+                .ThenByDescending(snapshot => snapshot.Bot.currentLocation != null ? 1000 : 0)
+                .ThenByDescending(snapshot =>
+                    knownCanonicalByGuid.TryGetValue(snapshot.Bot.BotGuid, out var known)
+                    && ReferenceEquals(known, snapshot.Bot) ? 500 : 0)
+                .ThenBy(snapshot => snapshot.Bot.CreatedTick)
+                .FirstOrDefault();
+        }
+
+        private bool IsSafeDuplicateDelete(BotSnapshot duplicate, BotSnapshot canonical, List<BotSnapshot> group)
+        {
+            if (duplicate == null || canonical == null || ReferenceEquals(duplicate.Bot, canonical.Bot))
+                return false;
+            if (duplicate.Classification != "BrickedDuplicate")
+                return false;
+            if (HasValuableInventory(duplicate.Bot))
+                return false;
+            if (duplicate.InSupervisorState)
+                return false;
+            if (duplicate.IsStored)
+                return false;
+            if (!duplicate.IsPlaced)
+                return false;
+            if (group.Count(snapshot => snapshot.IsPlaced) <= 1 && duplicate.IsPlaced)
+                return false;
+            if (group.Count <= 1)
+                return false;
+
+            bool sameName = string.Equals(duplicate.Bot.name, canonical.Bot.name, StringComparison.OrdinalIgnoreCase);
+            return sameName;
+        }
+
+        private bool IsBrickedDuplicate(BotSnapshot duplicate, BotSnapshot canonical, List<BotSnapshot> group)
+        {
+            if (duplicate == null || canonical == null || ReferenceEquals(duplicate.Bot, canonical.Bot))
+                return false;
+
+            if (!duplicate.IsPlaced || duplicate.IsStored || duplicate.InSupervisorState)
+                return false;
+
+            if (HasValuableInventory(duplicate.Bot))
+                return false;
+
+            bool sameName = string.Equals(duplicate.Bot.name, canonical.Bot.name, StringComparison.OrdinalIgnoreCase);
+            if (!sameName)
+                return false;
+
+            if (!IsFunctionalWorldBotSnapshot(canonical, isCanonical: true))
+                return false;
+
+            if (string.Equals(duplicate.Bot.BotGuid, canonical.Bot.BotGuid, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            if (group.Count(snapshot => string.Equals(snapshot.Bot.name, duplicate.Bot.name, StringComparison.OrdinalIgnoreCase)) <= 1)
+                return false;
+
+            return true;
+        }
+
+        private void DeleteBrickedDuplicate(BotObject bot)
+        {
+            if (bot == null)
+                return;
+
+            var beforeSnapshots = BuildBotSnapshots(validateFirst: false);
+            ModEntry.instance.Monitor.Log(
+                $"Bot dedupe before remove: total={beforeSnapshots.Count} world={beforeSnapshots.Count(snapshot => snapshot.IsPlaced)} tracked={beforeSnapshots.Count(snapshot => snapshot.IsTracked)} target={bot.name} guid={bot.BotGuid}.",
+                LogLevel.Warn);
+            ClearBotScriptQueue(bot);
+            CancelSupervisorPlan(bot);
+            RemoveBotFromWorld(bot);
+            RemoveBotFromRegistries(bot);
+            bot.IsQuarantined = true;
+            bot.modData[ModEntry.GetModDataKey("duplicateCleanup")] = "removed-bricked-duplicate";
+            var afterSnapshots = BuildBotSnapshots(validateFirst: false);
+            ModEntry.instance.Monitor.Log(
+                $"Bot dedupe after remove: total={afterSnapshots.Count} world={afterSnapshots.Count(snapshot => snapshot.IsPlaced)} tracked={afterSnapshots.Count(snapshot => snapshot.IsTracked)} target={bot.name} guid={bot.BotGuid}.",
+                LogLevel.Warn);
+        }
+
+        private void RemoveBotFromRegistries(BotObject bot)
+        {
+            if (bot == null)
+                return;
+
+            BotManager.instances.RemoveAll(existing => ReferenceEquals(existing, bot));
+            foreach (var remoteBots in BotManager.remoteInstances.Values)
+                remoteBots.RemoveAll(existing => ReferenceEquals(existing, bot));
+        }
+
+        private bool HasValuableInventory(BotObject bot)
+        {
+            if (bot?.inventory == null)
+                return false;
+
+            foreach (var item in bot.inventory)
+            {
+                if (item == null)
+                    continue;
+
+                if (item is Tool tool)
+                {
+                    if (tool.UpgradeLevel > 0)
+                        return true;
+                    if (!IsDefaultTool(tool))
+                        return true;
+                    continue;
+                }
+
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsDefaultTool(Tool tool)
+        {
+            return tool is Axe
+                or Hoe
+                or Pickaxe
+                or WateringCan
+                || (tool is MeleeWeapon weapon && weapon.isScythe());
+        }
+
+        private string DescribeBotSnapshot(BotSnapshot snapshot)
+        {
+            if (snapshot == null)
+                return "(null)";
+
+            string loc = snapshot.Location?.NameOrUniqueName
+                ?? snapshot.Bot.currentLocation?.NameOrUniqueName
+                ?? "(null)";
+            string tile = $"{snapshot.Tile.X},{snapshot.Tile.Y}";
+            string storage = snapshot.IsStored ? $" stored={snapshot.Container}" : "";
+            return $"{snapshot.Bot.name} guid={snapshot.Bot.BotGuid} class={snapshot.Classification} reason={GetBotClassificationReason(snapshot)} loc={loc} tile={tile} tracked={snapshot.IsTracked} placed={snapshot.IsPlaced}{storage} valuable={HasValuableInventory(snapshot.Bot)}";
+        }
+
+        private string GetBotClassificationReason(BotSnapshot snapshot)
+        {
+            if (snapshot == null)
+                return "none";
+
+            if (snapshot.Classification == "BrickedDuplicate")
+                return "duplicate-name, non-canonical, empty, placed-world-object, not supervisor-active";
+
+            if (snapshot.Classification == "StoredBot")
+                return "stored";
+
+            if (snapshot.Classification == "FunctionalWorldBot")
+                return "canonical, placed, registered, supervisor-eligible";
+
+            if (snapshot.Classification == "PlacedButNotRegistered")
+                return "placed world object missing registry";
+
+            if (snapshot.Classification == "RegisteredGhost")
+                return "registered but not placed";
+
+            if (snapshot.Classification == "QuarantinedDuplicate")
+                return "quarantined duplicate";
+
+            return "ambiguous";
+        }
+
+        private string GetDuplicateQuarantineReason(BotSnapshot duplicate, BotSnapshot canonical, List<BotSnapshot> group)
+        {
+            if (duplicate == null)
+                return "ambiguous";
+            if (HasValuableInventory(duplicate.Bot))
+                return "valuable inventory";
+            if (duplicate.InSupervisorState)
+                return "supervisor-active";
+            if (duplicate.IsStored)
+                return "stored";
+            if (group.Count <= 1)
+                return "only copy of that name";
+            if (canonical != null && string.Equals(duplicate.Bot.BotGuid, canonical.Bot.BotGuid, StringComparison.OrdinalIgnoreCase))
+                return "duplicate GUID uncertainty";
+            if (!duplicate.IsPlaced)
+                return "not placed world object";
+            return "ambiguous";
+        }
+
+        public void RecallBotsHome()
+        {
+            AssignMissingBotIdentities();
+            var farm = Game1.getLocationFromName("Farm");
+            if (farm == null)
+            {
+                ModEntry.instance.Monitor.Log("RecallBotsHome refused: Farm location unavailable.", LogLevel.Warn);
+                return;
+            }
+
+            foreach (var snapshot in BuildBotSnapshots(validateFirst: false)
+                .Where(snapshot => snapshot.Classification == "FunctionalWorldBot")
+                .Where(snapshot => namedHomeTiles.ContainsKey(snapshot.Bot.name ?? ""))
+                .ToList())
+            {
+                var bot = snapshot.Bot;
+                var homeTile = namedHomeTiles[bot.name];
+                if (!TryFindSafeRelocationTile(bot, farm, homeTile, out var targetTile))
+                {
+                    ModEntry.instance.Monitor.Log(
+                        $"RecallBotsHome refused for {bot.name} guid={bot.BotGuid}: no safe tile near home {homeTile.X},{homeTile.Y}.",
+                        LogLevel.Warn);
+                    continue;
+                }
+                ModEntry.instance.Monitor.Log(
+                    $"RecallBotsHome moving functional world bot {bot.name} guid={bot.BotGuid} from {snapshot.Location?.NameOrUniqueName ?? "(null)"} {snapshot.Tile.X},{snapshot.Tile.Y}.",
+                    LogLevel.Warn);
+                RelocateExistingBotInstance(bot, farm, targetTile, "RecallBotsHome");
+            }
+        }
+
         public void ReportAllBots()
         {
             var player = Game1.player;
@@ -2144,49 +4044,479 @@ private static void AddScriptFooter(List<string> lines)
                     int dy = (int)(tile.Y - playerPos.Y / 64);
                     relative = $" relative dx={dx}, dy={dy}";
                 }
-
+                ReportBotInventory(bot);
                 string msg = $"{bot.name}: {locName} tile {(int)tile.X},{(int)tile.Y} facing {bot.facingDirection}{relative}";
                 ModEntry.instance.Monitor.Log(msg);
                 Game1.addHUDMessage(new HUDMessage(msg, HUDMessage.newQuest_type));
             }
         }
 
-        public void WarpSameLocationBotsToPlayer()
+        public void ReportAllBotPersistenceState()
+        {
+            var snapshots = BuildBotSnapshots(validateFirst: true);
+
+            ModEntry.instance.Monitor.Log("=== Farmtronics Bot Persistence Report ===", LogLevel.Warn);
+            ModEntry.instance.Monitor.Log(
+                $"Tracked bots: {snapshots.Count(snapshot => snapshot.IsTracked)}; " +
+                $"physical world bots: {snapshots.Count(snapshot => snapshot.IsPlaced)}; " +
+                $"stored bots: {snapshots.Count(snapshot => snapshot.IsStored)}.",
+                LogLevel.Warn);
+
+            ModEntry.instance.Monitor.Log("-- All classified bots --", LogLevel.Warn);
+            foreach (var snapshot in snapshots.OrderBy(snapshot => snapshot.Bot.name).ThenBy(snapshot => snapshot.Bot.BotGuid))
+            {
+                ModEntry.instance.Monitor.Log(DescribeBotSnapshot(snapshot), LogLevel.Warn);
+                ReportBotInventory(snapshot.Bot);
+            }
+
+            LogDuplicateSummary(snapshots);
+            CleanupStaleReservations(Game1.currentGameTime.TotalGameTime);
+            LogReservationReport(Game1.currentGameTime.TotalGameTime);
+            LogOrdersReport();
+
+            ModEntry.instance.Monitor.Log("=== End Farmtronics Bot Persistence Report ===", LogLevel.Warn);
+        }
+
+        private void LogOrdersReport()
+        {
+            ModEntry.instance.Monitor.Log("-- Bot orders --", LogLevel.Warn);
+            foreach (var bot in BotManager.GetAllBots().Where(bot => bot != null).OrderBy(bot => bot.name))
+            {
+                var orders = GetOrdersForBot(bot);
+                ModEntry.instance.Monitor.Log(
+                    $"  {bot.name}: mode={orders.Mode} capabilities={FormatCapabilities(orders.Capabilities)} zones={FormatZones(orders)} idleReason={botStates.Values.FirstOrDefault(state => ReferenceEquals(state.Bot, bot))?.LastNoPlanReason ?? "(none)"}",
+                    LogLevel.Warn);
+            }
+
+            ModEntry.instance.Monitor.Log("-- Bot zones --", LogLevel.Warn);
+            if (botZones.Count == 0)
+            {
+                ModEntry.instance.Monitor.Log("  none", LogLevel.Warn);
+                return;
+            }
+
+            foreach (var zone in botZones.Values.OrderBy(zone => zone.Name))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"  {zone.Name}: loc={zone.LocationName} rect={zone.Bounds.Left},{zone.Bounds.Top}..{zone.Bounds.Right - 1},{zone.Bounds.Bottom - 1}",
+                    LogLevel.Warn);
+            }
+        }
+
+        private void LogDuplicateSummary(List<BotSnapshot> snapshots)
+        {
+            foreach (var group in snapshots
+                .GroupBy(snapshot => snapshot.Bot.name ?? snapshot.Bot.Name ?? "(unnamed)", StringComparer.OrdinalIgnoreCase)
+                .Where(group => group.Count() > 1))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"duplicate name: {group.Key} count={group.Count()} canonical={DescribeBotSnapshot(ChooseCanonicalBot(group.ToList()))}",
+                    LogLevel.Warn);
+            }
+
+            foreach (var group in snapshots
+                .Where(snapshot => !string.IsNullOrWhiteSpace(snapshot.Bot.BotGuid))
+                .GroupBy(snapshot => snapshot.Bot.BotGuid, StringComparer.OrdinalIgnoreCase)
+                .Where(group => group.Count() > 1))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"duplicate guid: {group.Key} count={group.Count()} canonical={DescribeBotSnapshot(ChooseCanonicalBot(group.ToList()))}",
+                    LogLevel.Warn);
+            }
+
+            foreach (var group in snapshots
+                .Where(snapshot => snapshot.IsPlaced && snapshot.Location != null)
+                .GroupBy(snapshot => $"{snapshot.Location.NameOrUniqueName}:{snapshot.Tile.X},{snapshot.Tile.Y}")
+                .Where(group => group.Count() > 1))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"duplicate physical tile: {group.Key} bots={string.Join(", ", group.Select(snapshot => snapshot.Bot.name + "/" + snapshot.Bot.BotGuid))}",
+                LogLevel.Warn);
+            }
+        }
+
+        public void MoveBotHere(string botName)
+        {
+            botName = NormalizeBotName(botName);
+            var player = Game1.player;
+            var location = player?.currentLocation;
+            if (location == null)
+            {
+                ModEntry.instance.Monitor.Log("ft_bot_move_here refused: player location unavailable.", LogLevel.Warn);
+                return;
+            }
+
+            var preferredTile = GetTileAhead(player.Tile, player.FacingDirection);
+            RelocateNamedBot(botName, location, preferredTile, "ft_bot_move_here");
+        }
+
+        public void HandlePlayerWarped(WarpedEventArgs args)
+        {
+            if (args == null || !args.IsLocalPlayer)
+                return;
+
+            if (args.OldLocation is not MineShaft || args.NewLocation is not MineShaft)
+                return;
+
+            var player = args.Player ?? Game1.player;
+            var preferredTile = player?.Tile ?? Game1.player?.Tile ?? Vector2.Zero;
+            int moved = 0;
+
+            foreach (var bot in BotManager.GetAllBots().Where(bot => ShouldFollowPlayerToMineLevel(bot, args.OldLocation)).ToList())
+            {
+                if (!TryFindSafeRelocationTile(bot, args.NewLocation, preferredTile, out var targetTile))
+                {
+                    ModEntry.instance.Monitor.Log(
+                        $"Mine follow skipped for {bot.name}: no safe tile near {args.NewLocation.NameOrUniqueName} {preferredTile.X},{preferredTile.Y}.",
+                        LogLevel.Warn);
+                    continue;
+                }
+
+                RelocateExistingBotInstance(bot, args.NewLocation, targetTile, "MineLevelFollow");
+                moved++;
+            }
+
+            if (moved > 0)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"MineLevelFollow moved {moved} bot(s) from {args.OldLocation.NameOrUniqueName} to {args.NewLocation.NameOrUniqueName}.",
+                    LogLevel.Trace);
+            }
+        }
+
+        private bool ShouldFollowPlayerToMineLevel(BotObject bot, GameLocation oldLocation)
+        {
+            if (bot == null || bot.IsQuarantined || oldLocation == null)
+                return false;
+
+            if (!ReferenceEquals(bot.currentLocation, oldLocation))
+                return false;
+
+            var orders = GetOrdersForBot(bot);
+            if (orders.Mode == BotOrderMode.Follow)
+                return true;
+
+            return orders.Mode == BotOrderMode.Work
+                && (orders.Capabilities & BotCapability.Mine) != 0;
+        }
+
+        public void SendBotHome(string botName)
+        {
+            botName = NormalizeBotName(botName);
+            if (string.IsNullOrWhiteSpace(botName))
+            {
+                ModEntry.instance.Monitor.Log("ft_bot_send_home refused: missing bot name.", LogLevel.Warn);
+                return;
+            }
+
+            if (!namedHomeTiles.TryGetValue(botName, out var homeTile))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"ft_bot_send_home refused for {botName}: no configured home tile.",
+                    LogLevel.Warn);
+                return;
+            }
+
+            var farm = Game1.getLocationFromName("Farm");
+            if (farm == null)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"ft_bot_send_home refused for {botName}: Farm location unavailable.",
+                    LogLevel.Warn);
+                return;
+            }
+
+            RelocateNamedBot(botName, farm, homeTile, "ft_bot_send_home");
+        }
+
+        private void RelocateNamedBot(string botName, GameLocation destination, Vector2 preferredTile, string commandName)
+        {
+            botName = NormalizeBotName(botName);
+            if (string.IsNullOrWhiteSpace(botName))
+            {
+                ModEntry.instance.Monitor.Log($"{commandName} refused: missing bot name.", LogLevel.Warn);
+                return;
+            }
+
+            AssignMissingBotIdentities();
+            var snapshots = BuildBotSnapshots(validateFirst: false);
+            var matching = snapshots
+                .Where(snapshot => string.Equals(NormalizeBotName(snapshot.Bot.name), botName, StringComparison.OrdinalIgnoreCase))
+                .ToList();
+            var functional = matching
+                .Where(snapshot => snapshot.Classification == "FunctionalWorldBot")
+                .ToList();
+            var selected = functional.Count == 1 ? functional[0] : null;
+            if (selected == null
+                && matching.Count == 1
+                && matching[0].Bot.IsQuarantined
+                && matching[0].IsPlaced
+                && !matching[0].IsStored)
+            {
+                selected = matching[0];
+                ModEntry.instance.Monitor.Log(
+                    $"{commandName}: recovering explicitly named quarantined bot {selected.Bot.name} guid={selected.Bot.BotGuid}.",
+                    LogLevel.Warn);
+            }
+            var ambiguousSameName = matching
+                .Where(snapshot => !ReferenceEquals(snapshot, selected)
+                    && snapshot.Classification != "FunctionalWorldBot"
+                    && snapshot.Classification != "BrickedDuplicate")
+                .ToList();
+
+            if (selected == null || ambiguousSameName.Count > 0)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"{commandName} refused for {botName}: found {functional.Count} canonical functional world candidate(s) and {ambiguousSameName.Count} ambiguous same-name candidate(s) among {matching.Count} matching bot snapshot(s). Run ft_bot_report / ft_bot_dedupe first.",
+                    LogLevel.Warn);
+                foreach (var snapshot in matching)
+                    ModEntry.instance.Monitor.Log($"  candidate: {DescribeBotSnapshot(snapshot)}", LogLevel.Warn);
+                return;
+            }
+
+            if (selected.IsStored)
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"{commandName} refused for {botName}: selected bot is stored in {selected.Container}.",
+                    LogLevel.Warn);
+                return;
+            }
+
+            if (!TryFindSafeRelocationTile(selected.Bot, destination, preferredTile, out var targetTile))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"{commandName} refused for {botName}: no safe destination tile near {destination.NameOrUniqueName} {preferredTile.X},{preferredTile.Y}.",
+                    LogLevel.Warn);
+                return;
+            }
+
+            RelocateExistingBotInstance(selected.Bot, destination, targetTile, commandName);
+        }
+
+        private void RelocateExistingBotInstance(BotObject bot, GameLocation destination, Vector2 targetTile, string reason)
+        {
+            var oldEntry = ScanWorldForBotObjects().FirstOrDefault(entry => ReferenceEquals(entry.Bot, bot));
+            string oldLocationName = oldEntry?.Location?.NameOrUniqueName ?? bot.currentLocation?.NameOrUniqueName ?? "(null)";
+            Vector2 oldTile = oldEntry?.Tile ?? bot.TileLocation;
+
+            _ = bot.BotGuid;
+            ClearBotScriptQueue(bot);
+            CancelSupervisorPlan(bot);
+
+            if (oldEntry != null
+                && oldEntry.Location.objects.TryGetValue(oldEntry.Tile, out StardewValley.Object oldObject)
+                && ReferenceEquals(oldObject, bot))
+            {
+                oldEntry.Location.objects.Remove(oldEntry.Tile);
+            }
+            else
+            {
+                RemoveBotFromWorld(bot);
+            }
+
+            bot.currentLocation = destination;
+            bot.TileLocation = targetTile;
+            bot.Position = targetTile.GetAbsolutePosition();
+            ClearBotQuarantine(bot, reason);
+            bot.data.Update();
+            destination.objects[targetTile] = bot;
+            BotManager.RegisterLocalBot(bot, reason);
+            UpdateSupervisorStateAfterRelocation(bot, targetTile);
+
+            ModEntry.instance.Monitor.Log(
+                $"{reason}: moved {bot.name} guid={bot.BotGuid} from {oldLocationName} {oldTile.X},{oldTile.Y} to {destination.NameOrUniqueName} {targetTile.X},{targetTile.Y}.",
+                LogLevel.Warn);
+            ReportBotInventory(bot);
+        }
+
+        private void UpdateSupervisorStateAfterRelocation(BotObject bot, Vector2 targetTile)
+        {
+            var now = Game1.currentGameTime.TotalGameTime;
+            var state = botStates.Values.FirstOrDefault(state => ReferenceEquals(state.Bot, bot));
+            if (state == null)
+                return;
+
+            state.Bot = bot;
+            ClearCurrentPlan(state);
+            state.Mode = BotMode.Planning;
+            state.LastObservedTile = targetTile;
+            state.LastMovementAt = now;
+            state.NextAllowedPlanAt = now + TimeSpan.FromSeconds(1);
+            state.LastNoPlanReason = "Bot relocated safely.";
+        }
+
+        private bool TryFindSafeRelocationTile(BotObject bot, GameLocation location, Vector2 preferredTile, out Vector2 safeTile)
+        {
+            if (IsRelocationTileSafeForBot(bot, location, preferredTile))
+            {
+                safeTile = preferredTile;
+                return true;
+            }
+
+            for (int radius = 1; radius <= 12; radius++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    for (int dy = -radius; dy <= radius; dy++)
+                    {
+                        if (Math.Abs(dx) != radius && Math.Abs(dy) != radius)
+                            continue;
+
+                        var candidate = preferredTile + new Vector2(dx, dy);
+                        if (IsRelocationTileSafeForBot(bot, location, candidate))
+                        {
+                            safeTile = candidate;
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            safeTile = Vector2.Zero;
+            return false;
+        }
+
+        private bool IsRelocationTileSafeForBot(BotObject bot, GameLocation location, Vector2 tile)
+        {
+            if (!IsTileSafeForBot(bot, location, tile))
+                return false;
+
+            if (location.terrainFeatures.ContainsKey(tile))
+                return false;
+
+            if (location.largeTerrainFeatures.Count > 0)
+            {
+                var tileRect = new Rectangle((int)tile.X * Game1.tileSize, (int)tile.Y * Game1.tileSize, Game1.tileSize, Game1.tileSize);
+                if (location.largeTerrainFeatures.Any(feature => feature.getBoundingBox().Intersects(tileRect)))
+                    return false;
+            }
+
+            bool occupiedBySelf = location.objects.TryGetValue(tile, out StardewValley.Object objAtTile)
+                && ReferenceEquals(objAtTile, bot);
+            if (!occupiedBySelf && location.IsTileOccupiedBy(tile))
+                return false;
+
+            return true;
+        }
+
+        public void PurgeExtraBotObjects()
+        {
+            ModEntry.instance.Monitor.Log(
+                "PurgeExtraBotObjects is now a non-destructive bot safety scan/quarantine.",
+                LogLevel.Warn);
+            ValidateBotPersistence();
+            RecallBotsHome();
+        }
+
+        private void PlaceDesiredBotsNearPlayer(Dictionary<string, BotObject> botsByName)
         {
             var player = Game1.player;
-            var loc = player.currentLocation;
-            var pos = player.Position;
+            var location = player.currentLocation;
+            if (location == null) return;
 
+            var playerTile = player.Tile;
             int offset = 1;
 
-            foreach (var bot in BotManager.GetAllBots())
+            foreach (var name in resetBotNames)
             {
-                if (bot == null) continue;
-                if (bot.currentLocation != loc) continue;
-                bool inBotStates = false;
-                foreach(var bss in botStates.Values) {
-                  if (bss.Bot == bot) {
-                    inBotStates = true;
-                    break;
-                  }
-                }
-                var targetPos = pos + new Vector2(offset * 64, 0);
+                if (!botsByName.TryGetValue(name, out var bot))
+                    continue;
+
+                var targetTile = FindNearbyOpenTile(location, playerTile, offset);
                 offset++;
-                Vector2 targetTile;
-                targetTile.X = (int)targetPos.X/64;
-                targetTile.Y = (int)targetPos.Y/64;
-                if (inBotStates) {
-                    botStates[bot.name].Mode = BotMode.Planning;
-                    botStates[bot.name].CurrentPlan = null;                   
-                }
-                bot.currentLocation = loc;
-                bot.Position = targetPos; 
-                bot.TileLocation = targetTile;
+                EnsureBotPlacedSafely(bot, location, targetTile);
+
                 ModEntry.instance.Monitor.Log(
-                    $"Warped {bot.name} to {loc.NameOrUniqueName} tile {targetTile.X},{targetTile.Y}");
+                    $"Requested reset bot placement for {bot.name} near {location.NameOrUniqueName} {targetTile.X},{targetTile.Y}.",
+                    LogLevel.Warn);
             }
-            StartAllBots();
         }
+
+        private static Vector2 FindNearbyOpenTile(GameLocation location, Vector2 playerTile, int preferredOffset)
+        {
+            var preferred = new Vector2(playerTile.X + preferredOffset, playerTile.Y);
+            if (CanPlaceResetBot(location, preferred))
+                return preferred;
+
+            for (int radius = 1; radius <= 4; radius++)
+            {
+                for (int dx = -radius; dx <= radius; dx++)
+                {
+                    for (int dy = -radius; dy <= radius; dy++)
+                    {
+                        if (Math.Abs(dx) != radius && Math.Abs(dy) != radius)
+                            continue;
+
+                        var candidate = new Vector2(playerTile.X + dx, playerTile.Y + dy);
+                        if (CanPlaceResetBot(location, candidate))
+                            return candidate;
+                    }
+                }
+            }
+
+            return preferred;
+        }
+
+        private static bool CanPlaceResetBot(GameLocation location, Vector2 tile)
+        {
+            return location.isTileOnMap(tile)
+                && !location.objects.ContainsKey(tile)
+                && !location.IsTileOccupiedBy(tile);
+        }
+
+        private static void RemoveBotFromWorld(BotObject bot)
+        {
+            foreach (var location in Game1.locations
+                .Concat(BotManager.GetAllBots().Where(existing => existing != null).Select(existing => existing.currentLocation))
+                .Append(Game1.player?.currentLocation)
+                .Where(location => location != null)
+                .Distinct<GameLocation>(ReferenceEqualityComparer.Instance))
+            {
+                Vector2? oldTile = null;
+                foreach (var pair in location.objects.Pairs)
+                {
+                    if (ReferenceEquals(pair.Value, bot))
+                    {
+                        oldTile = pair.Key;
+                        break;
+                    }
+                }
+
+                if (oldTile.HasValue)
+                    location.objects.Remove(oldTile.Value);
+            }
+        }
+
+        private void ClearBotScriptQueue(BotObject bot)
+        {
+            if (bot == null)
+                return;
+
+            var state = botStates.Values.FirstOrDefault(state => ReferenceEquals(state.Bot, bot));
+            if (state != null)
+                ReleaseReservationsForBot(state);
+
+            bot.CancelCurrentAction();
+
+            if (bot.shell == null)
+                return;
+
+            bot.shell.CancelCurrentCommand();
+
+            LogOncePerInterval(
+                $"clear-queue:{bot.BotGuid}",
+                $"Cleared queued commands and stopped script for {bot.name}.",
+                LogLevel.Trace,
+                TimeSpan.FromSeconds(1));
+        }
+
+        public void WarpSameLocationBotsToPlayer()
+        {
+            ModEntry.instance.Monitor.Log(
+                "WarpSameLocationBotsToPlayer disabled; recalling bots to separated home/safe tiles instead.",
+                LogLevel.Warn);
+            RecallBotsHome();
+        }        
         public void WarpPlayerHome()
         {
             if (!Context.IsWorldReady)
@@ -2238,6 +4568,305 @@ private static void AddScriptFooter(List<string> lines)
 			string locationName = location?.NameOrUniqueName ?? "";
 			return locationName + ":" + tile.X + "," + tile.Y;
 		}
+
+        private static string GetTileReservationKey(string locationName, Vector2 tile)
+        {
+            return $"{locationName ?? ""}:{(int)tile.X},{(int)tile.Y}";
+        }
+
+        private static string GetTileReservationKey(GameLocation location, Vector2 tile)
+        {
+            return GetTileReservationKey(location?.NameOrUniqueName ?? "", tile);
+        }
+
+        private static string GetBotReservationOwnerKey(BotObject bot)
+        {
+            if (!string.IsNullOrWhiteSpace(bot?.BotGuid))
+                return bot.BotGuid;
+
+            return bot?.name ?? "";
+        }
+
+        private static string GetReservationOwnerKey(BotReservation reservation)
+        {
+            if (!string.IsNullOrWhiteSpace(reservation?.BotGuid))
+                return reservation.BotGuid;
+
+            return reservation?.BotName ?? "";
+        }
+
+        private bool IsReservationOwnedBy(BotReservation reservation, BotObject bot)
+        {
+            if (reservation == null || bot == null)
+                return false;
+
+            return string.Equals(GetReservationOwnerKey(reservation), GetBotReservationOwnerKey(bot), StringComparison.OrdinalIgnoreCase);
+        }
+
+        private BotReservation CreateReservation(BotSupervisorState state, PendingPlan plan, Vector2 reservedTile, TimeSpan now)
+        {
+            return new BotReservation
+            {
+                BotName = state.Bot?.name ?? state.BotName,
+                BotGuid = state.Bot?.BotGuid,
+                JobType = plan.JobType.ToString(),
+                LocationName = plan.LocationName,
+                TargetTile = plan.TargetTile,
+                StandTile = plan.StandTile,
+                ReservedTile = reservedTile,
+                CreatedAt = now,
+                PlanId = plan.PlanId,
+            };
+        }
+
+        private bool TryGetOtherReservation(
+            Dictionary<string, BotReservation> reservations,
+            GameLocation location,
+            Vector2 tile,
+            BotObject bot,
+            out BotReservation reservation)
+        {
+            reservation = null;
+            if (location == null)
+                return false;
+
+            return reservations.TryGetValue(GetTileReservationKey(location, tile), out reservation)
+                && !IsReservationOwnedBy(reservation, bot);
+        }
+
+        private string GetJobReservationRejectionReason(BotSupervisorState state, BotJob job, GameLocation location)
+        {
+            var bot = state?.Bot;
+
+            if (TryGetOtherReservation(ReservedTargetTiles, location, job.TargetTile, bot, out var targetReservation))
+                return $"target reserved by {targetReservation.BotName}";
+
+            if (TryGetOtherReservation(ReservedStandTiles, location, job.AdjacentTile, bot, out var standReservation))
+                return $"stand reserved by {standReservation.BotName}";
+
+            if (TryGetOtherReservation(ReservedDestinationTiles, location, job.AdjacentTile, bot, out var destinationReservation))
+                return $"destination reserved by {destinationReservation.BotName}";
+
+            if (IsTileOccupiedByAnotherBot(bot, location, job.AdjacentTile))
+                return "destination occupied by another bot";
+
+            if (IsOtherBotHomeTile(state, location, job.AdjacentTile, out var homeOwner))
+                return $"destination is {homeOwner}'s home tile";
+
+            var conflictingPlan = botStates.Values
+                .Where(other => !ReferenceEquals(other, state))
+                .FirstOrDefault(other => other.CurrentPlan != null
+                    && string.Equals(other.CurrentPlan.LocationName, location?.NameOrUniqueName, StringComparison.Ordinal)
+                    && other.CurrentPlan.TargetTile == job.TargetTile);
+
+            if (conflictingPlan != null)
+                return $"target is already planned by {conflictingPlan.Bot?.name ?? conflictingPlan.BotName}";
+
+            conflictingPlan = botStates.Values
+                .Where(other => !ReferenceEquals(other, state))
+                .FirstOrDefault(other => other.CurrentPlan != null
+                    && string.Equals(other.CurrentPlan.LocationName, location?.NameOrUniqueName, StringComparison.Ordinal)
+                    && other.CurrentPlan.StandTile == job.AdjacentTile);
+
+            if (conflictingPlan != null)
+                return $"stand is already planned by {conflictingPlan.Bot?.name ?? conflictingPlan.BotName}";
+
+            return null;
+        }
+
+        private bool IsOtherBotHomeTile(BotSupervisorState state, GameLocation location, Vector2 tile, out string ownerName)
+        {
+            ownerName = null;
+            if (location?.NameOrUniqueName != "Farm")
+                return false;
+
+            foreach (var pair in namedHomeTiles)
+            {
+                if (pair.Value != tile)
+                    continue;
+
+                if (string.Equals(pair.Key, state?.Bot?.name ?? state?.BotName, StringComparison.OrdinalIgnoreCase))
+                    continue;
+
+                ownerName = pair.Key;
+                return true;
+            }
+
+            return false;
+        }
+
+        private bool IsTileReservedByOther(BotObject bot, GameLocation location, Vector2 tile)
+        {
+            return TryGetOtherReservation(ReservedTargetTiles, location, tile, bot, out _)
+                || TryGetOtherReservation(ReservedStandTiles, location, tile, bot, out _)
+                || TryGetOtherReservation(ReservedDestinationTiles, location, tile, bot, out _)
+                || TryGetOtherReservation(ReservedHomeTiles, location, tile, bot, out _);
+        }
+
+        private bool TryReservePlanForBot(BotSupervisorState state, PendingPlan plan, TimeSpan now, out string reason)
+        {
+            reason = null;
+            if (state?.Bot == null || plan == null)
+            {
+                reason = "missing bot or plan";
+                return false;
+            }
+
+            var location = state.Bot.currentLocation;
+            var pseudoJob = new BotJob
+            {
+                Type = plan.JobType,
+                TargetTile = plan.TargetTile,
+                AdjacentTile = plan.StandTile,
+                TargetName = plan.TargetName,
+            };
+
+            reason = GetJobReservationRejectionReason(state, pseudoJob, location);
+            if (reason != null)
+                return false;
+
+            var targetKey = GetTileReservationKey(plan.LocationName, plan.TargetTile);
+            var standKey = GetTileReservationKey(plan.LocationName, plan.StandTile);
+            var reservation = CreateReservation(state, plan, plan.TargetTile, now);
+            ReservedTargetTiles[targetKey] = reservation;
+            ReservedStandTiles[standKey] = CreateReservation(state, plan, plan.StandTile, now);
+            ReservedDestinationTiles[standKey] = CreateReservation(state, plan, plan.StandTile, now);
+
+            ModEntry.instance.Monitor.Log(
+                $"Reserved job for {state.Bot.name}: {plan.JobType} target={(int)plan.TargetTile.X},{(int)plan.TargetTile.Y} stand={(int)plan.StandTile.X},{(int)plan.StandTile.Y}.",
+                LogLevel.Trace);
+            return true;
+        }
+
+        private void ReleaseReservationsForBot(BotSupervisorState state)
+        {
+            if (state?.Bot == null && string.IsNullOrWhiteSpace(state?.BotName))
+                return;
+
+            string ownerKey = state.Bot != null ? GetBotReservationOwnerKey(state.Bot) : state.BotName;
+            var released = new List<BotReservation>();
+
+            ReleaseReservationsForOwner(ReservedTargetTiles, ownerKey, released);
+            ReleaseReservationsForOwner(ReservedStandTiles, ownerKey, released);
+            ReleaseReservationsForOwner(ReservedDestinationTiles, ownerKey, released);
+            ReleaseReservationsForOwner(ReservedHomeTiles, ownerKey, released);
+
+            if (released.Count == 0)
+                return;
+
+            var first = released[0];
+            ModEntry.instance.Monitor.Log(
+                $"Released reservations for {first.BotName}: target={(int)first.TargetTile.X},{(int)first.TargetTile.Y} stand={(int)first.StandTile.X},{(int)first.StandTile.Y}.",
+                LogLevel.Trace);
+        }
+
+        private static void ReleaseReservationsForOwner(
+            Dictionary<string, BotReservation> reservations,
+            string ownerKey,
+            List<BotReservation> released)
+        {
+            var keys = reservations
+                .Where(pair => string.Equals(GetReservationOwnerKey(pair.Value), ownerKey, StringComparison.OrdinalIgnoreCase))
+                .Select(pair => pair.Key)
+                .ToList();
+
+            foreach (var key in keys)
+            {
+                released.Add(reservations[key]);
+                reservations.Remove(key);
+            }
+        }
+
+        private void ClearCurrentPlan(BotSupervisorState state)
+        {
+            ReleaseReservationsForBot(state);
+            if (state != null)
+                state.CurrentPlan = null;
+        }
+
+        private void CleanupStaleReservations(TimeSpan now)
+        {
+            CleanupStaleReservations(ReservedTargetTiles, now);
+            CleanupStaleReservations(ReservedStandTiles, now);
+            CleanupStaleReservations(ReservedDestinationTiles, now);
+            CleanupStaleReservations(ReservedHomeTiles, now);
+        }
+
+        private void CleanupStaleReservations(Dictionary<string, BotReservation> reservations, TimeSpan now)
+        {
+            if (reservations.Count == 0)
+                return;
+
+            var staleKeys = reservations
+                .Where(pair => IsReservationStale(pair.Value, now))
+                .Select(pair => pair.Key)
+                .ToList();
+
+            foreach (var key in staleKeys)
+            {
+                var reservation = reservations[key];
+                reservations.Remove(key);
+                ModEntry.instance.Monitor.Log(
+                    $"Cleaned stale reservation for {reservation.BotName}: {reservation.JobType} loc={reservation.LocationName} tile={(int)reservation.ReservedTile.X},{(int)reservation.ReservedTile.Y}.",
+                    LogLevel.Trace);
+            }
+        }
+
+        private bool IsReservationStale(BotReservation reservation, TimeSpan now)
+        {
+            if (reservation == null)
+                return true;
+
+            if (now - reservation.CreatedAt > reservationTimeout)
+                return true;
+
+            var state = botStates.Values.FirstOrDefault(state =>
+                string.Equals(GetBotReservationOwnerKey(state.Bot), GetReservationOwnerKey(reservation), StringComparison.OrdinalIgnoreCase)
+                || string.Equals(state.BotName, reservation.BotName, StringComparison.OrdinalIgnoreCase));
+
+            if (state?.Bot == null)
+                return true;
+
+            var plan = state.CurrentPlan;
+            if (plan == null)
+                return true;
+
+            if (state.Mode == BotMode.Idle || state.Mode == BotMode.Cooldown || state.Mode == BotMode.Paused)
+                return true;
+
+            if (!string.Equals(state.Bot.currentLocation?.NameOrUniqueName, reservation.LocationName, StringComparison.Ordinal))
+                return true;
+
+            if (!string.Equals(plan.PlanId, reservation.PlanId, StringComparison.Ordinal))
+                return true;
+
+            return false;
+        }
+
+        private void LogReservationReport(TimeSpan now)
+        {
+            var allReservations = ReservedTargetTiles.Values
+                .Concat(ReservedStandTiles.Values)
+                .Concat(ReservedDestinationTiles.Values)
+                .Concat(ReservedHomeTiles.Values)
+                .GroupBy(reservation => $"{reservation.PlanId}:{reservation.LocationName}:{reservation.BotName}:{reservation.TargetTile}:{reservation.StandTile}")
+                .Select(group => group.First())
+                .ToList();
+
+            ModEntry.instance.Monitor.Log("-- Active bot reservations --", LogLevel.Warn);
+            if (allReservations.Count == 0)
+            {
+                ModEntry.instance.Monitor.Log("  none", LogLevel.Warn);
+                return;
+            }
+
+            foreach (var reservation in allReservations.OrderBy(r => r.LocationName).ThenBy(r => r.BotName))
+            {
+                ModEntry.instance.Monitor.Log(
+                    $"  {reservation.LocationName}: owner={reservation.BotName} guid={reservation.BotGuid} job={reservation.JobType} target={(int)reservation.TargetTile.X},{(int)reservation.TargetTile.Y} stand={(int)reservation.StandTile.X},{(int)reservation.StandTile.Y} age={(now - reservation.CreatedAt).TotalSeconds:0}s stale={IsReservationStale(reservation, now)}",
+                    LogLevel.Warn);
+            }
+        }
 
 		private static bool IsSupervisorPassable(GameLocation location, Vector2 tile) {
             if (!IsWithinMap(location, tile)) return false;

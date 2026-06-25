@@ -7,12 +7,11 @@ using StardewValley;
 
 namespace Farmtronics.Multiplayer.Messages {
 	class AddBotInstance : BaseMessage<AddBotInstance> {
-		private const int maxAttempts = 3;
 		private int attempt = 1;
 		public string LocationName { get; set; }
 		public Vector2 TileLocation { get; set; }
 
-		public bool HasGivenUp => attempt >= maxAttempts;
+		public bool HasGivenUp => false;
 
 		public static void Send(BotObject bot) {
 			var message = new AddBotInstance() {
@@ -23,7 +22,7 @@ namespace Farmtronics.Multiplayer.Messages {
 		}
 		
 		private GameLocation GetLocation() {
-			return ModEntry.instance.Helper.Multiplayer.GetActiveLocations().Single(location => location.NameOrUniqueName == LocationName);
+			return ModEntry.instance.Helper.Multiplayer.GetActiveLocations().SingleOrDefault(location => location.NameOrUniqueName == LocationName);
 		}
 		
 		private BotObject GetBotFromLocation(GameLocation location) {
@@ -32,23 +31,25 @@ namespace Farmtronics.Multiplayer.Messages {
 
 		public override void Apply() {
 			var location = GetLocation();
-			var bot = GetBotFromLocation(location);
-			if (bot == null && attempt < maxAttempts) {
-				ModEntry.instance.Monitor.Log($"Could not add new bot instance. Trying again later.", LogLevel.Warn);
+			if (location == null) {
+				ModEntry.instance.Monitor.Log(
+					$"Bot persistence WARN: location {LocationName} is not active for bot registration; retrying, attempt {attempt}.",
+					LogLevel.Warn);
 				if (!BotManager.lostInstances.Contains(this)) BotManager.lostInstances.Add(this);
 				attempt++;
 				return;
 			}
-			else if (bot == null) {
-				// Only log this message once.
-				if (attempt == maxAttempts) {
-					ModEntry.instance.Monitor.Log($"Could not add new bot instance. Aborting after {attempt} attempts.", LogLevel.Error);	
-				}
+			var bot = GetBotFromLocation(location);
+			if (bot == null) {
+				ModEntry.instance.Monitor.Log(
+					$"Bot persistence WARN: could not add bot instance at {LocationName} {TileLocation.X},{TileLocation.Y}; retrying, attempt {attempt}.",
+					LogLevel.Warn);
+				if (!BotManager.lostInstances.Contains(this)) BotManager.lostInstances.Add(this);
 				attempt++;
 				return;
 			}
 			BotManager.lostInstances.Remove(this);
-			BotManager.instances.Add(bot);
+			BotManager.RegisterLocalBot(bot, "multiplayer add instance");
 			bot.data.Load();
 			bot.currentLocation = location;
 			ModEntry.instance.Monitor.Log($"Successfully added bot to instance list: {LocationName} - {TileLocation}", LogLevel.Info);

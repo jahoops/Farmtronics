@@ -186,6 +186,21 @@ namespace Farmtronics.M1 {
 			}
 		}
 
+		public void ClearQueuedCommands()
+		{
+			queuedCommands.Clear();
+		}
+
+		public void CancelCurrentCommand()
+		{
+			ClearQueuedCommands();
+			runProgram = false;
+			inputReceived = null;
+			if (interpreter != null)
+				interpreter.Stop();
+			console.keyBuffer.Clear();
+		}
+
 		void GetCommand() {
 			if (console.InputInProgress()) return;		// already working on it!
 			TextDisplay disp = console.display;

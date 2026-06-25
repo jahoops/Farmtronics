@@ -38,6 +38,18 @@ namespace Farmtronics
 			MOD_ID = ModManifest.UniqueID;
 			localHelper = helper;
 			I18n.Init(helper.Translation);
+			helper.ConsoleCommands.Add("ft_bot_report", "Report Farmtronics bot identity, placement, storage, registry, duplicates, and inventory.", BotReportCommand);
+			helper.ConsoleCommands.Add("ft_bot_dedupe_dryrun", "Preview safe Farmtronics bot duplicate cleanup without changing anything.", BotDedupeDryRunCommand);
+			helper.ConsoleCommands.Add("ft_bot_dedupe", "Safely clean obvious empty Farmtronics bot duplicates and quarantine ambiguous duplicates.", BotDedupeCommand);
+			helper.ConsoleCommands.Add("ft_bot_move_here", "Move one canonical functional world bot near the player. Usage: ft_bot_move_here <bot name>", BotMoveHereCommand);
+			helper.ConsoleCommands.Add("ft_bot_relocate", "Alias for ft_bot_move_here. Usage: ft_bot_relocate <bot name>", BotMoveHereCommand);
+			helper.ConsoleCommands.Add("ft_bot_send_home", "Move one canonical functional world bot to its configured home tile. Usage: ft_bot_send_home <bot name>", BotSendHomeCommand);
+			helper.ConsoleCommands.Add("ft_bot_role", "Set bot capabilities. Usage: ft_bot_role <bot name> <capability...>", BotRoleCommand);
+			helper.ConsoleCommands.Add("ft_bot_mode", "Set bot mode. Usage: ft_bot_mode <bot name> <off|work|home|follow>", BotModeCommand);
+			helper.ConsoleCommands.Add("ft_bot_zone_start", "Start a bot zone rectangle at the player tile. Usage: ft_bot_zone_start <zone name>", BotZoneStartCommand);
+			helper.ConsoleCommands.Add("ft_bot_zone_end", "Finish a bot zone rectangle at the player tile. Usage: ft_bot_zone_end <zone name>", BotZoneEndCommand);
+			helper.ConsoleCommands.Add("ft_bot_assign_zone", "Assign a named zone to a bot. Usage: ft_bot_assign_zone <bot name> <zone name>", BotAssignZoneCommand);
+			helper.ConsoleCommands.Add("ft_bot_status", "Report one bot's orders and idle reason. Usage: ft_bot_status <bot name>", BotStatusCommand);
 #if DEBUG
 			// HACK not needed:
 			helper.Events.Input.ButtonPressed += OnButtonPressed;
@@ -59,6 +71,7 @@ namespace Farmtronics
 			helper.Events.Multiplayer.PeerConnected += MultiplayerManager.OnPeerConnected;
 			helper.Events.Multiplayer.PeerDisconnected += MultiplayerManager.OnPeerDisconnected;
 			helper.Events.Player.Warped += BotManager.FindLostInstancesOnWarp;
+			helper.Events.Player.Warped += SupervisorPlayerWarped;
 			
 			ModData.Initialize();
 			
@@ -67,6 +80,113 @@ namespace Farmtronics
 			Monitor.Log($"read {Assets.FontList.Length} lines from fontList, starting with {Assets.FontList[0]}");
 			sysDisk = new RealFileDisk(Path.Combine(instance.Helper.DirectoryPath, "assets", "sysdisk"));
 			sysDisk.readOnly = true;
+		}
+
+		private void BotReportCommand(string command, string[] args) {
+			supervisor.ReportAllBotPersistenceState();
+		}
+
+		private void BotDedupeDryRunCommand(string command, string[] args) {
+			supervisor.SafeCleanupDuplicateBots(dryRun: true);
+		}
+
+		private void BotDedupeCommand(string command, string[] args) {
+			supervisor.SafeCleanupDuplicateBots(dryRun: false);
+			supervisor.ReportAllBotPersistenceState();
+		}
+
+		private void BotMoveHereCommand(string command, string[] args) {
+			string botName = string.Join(" ", args ?? System.Array.Empty<string>()).Trim();
+			if (string.IsNullOrWhiteSpace(botName)) {
+				Monitor.Log($"Usage: {command} <bot name>", LogLevel.Warn);
+				return;
+			}
+			supervisor.MoveBotHere(botName);
+		}
+
+		private void BotSendHomeCommand(string command, string[] args) {
+			string botName = string.Join(" ", args ?? System.Array.Empty<string>()).Trim();
+			if (string.IsNullOrWhiteSpace(botName)) {
+				Monitor.Log($"Usage: {command} <bot name>", LogLevel.Warn);
+				return;
+			}
+			supervisor.SendBotHome(botName);
+		}
+
+		private void BotRoleCommand(string command, string[] args) {
+			if (args == null || args.Length < 2) {
+				Monitor.Log($"Usage: {command} <bot name> <capability...>", LogLevel.Warn);
+				return;
+			}
+
+			int firstCapability = -1;
+			for (int i = 0; i < args.Length; i++) {
+				if (supervisor.TryParseCapability(args[i], out _)) {
+					firstCapability = i;
+					break;
+				}
+			}
+
+			if (firstCapability <= 0) {
+				Monitor.Log($"Usage: {command} <bot name> <capability...>", LogLevel.Warn);
+				return;
+			}
+
+			string botName = string.Join(" ", args.Take(firstCapability)).Trim();
+			supervisor.SetBotRole(botName, args.Skip(firstCapability));
+		}
+
+		private void BotModeCommand(string command, string[] args) {
+			if (args == null || args.Length < 2) {
+				Monitor.Log($"Usage: {command} <bot name> <off|work|home|follow>", LogLevel.Warn);
+				return;
+			}
+
+			string modeName = args[^1];
+			string botName = string.Join(" ", args.Take(args.Length - 1)).Trim();
+			supervisor.SetBotOrderMode(botName, modeName);
+		}
+
+		private void BotZoneStartCommand(string command, string[] args) {
+			string zoneName = string.Join(" ", args ?? System.Array.Empty<string>()).Trim();
+			if (string.IsNullOrWhiteSpace(zoneName)) {
+				Monitor.Log($"Usage: {command} <zone name>", LogLevel.Warn);
+				return;
+			}
+			supervisor.StartZoneDraft(zoneName);
+		}
+
+		private void BotZoneEndCommand(string command, string[] args) {
+			string zoneName = string.Join(" ", args ?? System.Array.Empty<string>()).Trim();
+			if (string.IsNullOrWhiteSpace(zoneName)) {
+				Monitor.Log($"Usage: {command} <zone name>", LogLevel.Warn);
+				return;
+			}
+			supervisor.EndZoneDraft(zoneName);
+		}
+
+		private void BotAssignZoneCommand(string command, string[] args) {
+			if (args == null || args.Length < 2) {
+				Monitor.Log($"Usage: {command} <bot name> <zone name>", LogLevel.Warn);
+				return;
+			}
+
+			string zoneName = args[^1];
+			string botName = string.Join(" ", args.Take(args.Length - 1)).Trim();
+			supervisor.AssignZoneToBot(botName, zoneName);
+		}
+
+		private void BotStatusCommand(string command, string[] args) {
+			string botName = string.Join(" ", args ?? System.Array.Empty<string>()).Trim();
+			if (string.IsNullOrWhiteSpace(botName)) {
+				Monitor.Log($"Usage: {command} <bot name>", LogLevel.Warn);
+				return;
+			}
+			supervisor.ReportBotStatus(botName);
+		}
+
+		private void SupervisorPlayerWarped(object sender, WarpedEventArgs args) {
+			supervisor.HandlePlayerWarped(args);
 		}
 
 		private void OnSaveCreated(object sender, SaveCreatedEventArgs e) {
@@ -108,6 +228,7 @@ namespace Farmtronics
 				if (msg == "FarmtronicsFirstBotMail") {
 					Monitor.Log($"Changing recoveredItem from {Game1.player.recoveredItem} to Bot");
 					var bot = new BotObject();
+					bot.ResetIdentity("first-bot-mail");
 					bot.displayName = I18n.Bot_Name(BotManager.botCount);
 					BotManager.botCount++;
 					bot.owner.Value = Game1.player.UniqueMultiplayerID;
@@ -134,11 +255,11 @@ namespace Farmtronics
 				Monitor.Log($"Object Lookup result [occupied: {occupied}]: {name}");
 				break;
 			case SButton.F6:
-				Monitor.Log("F6 pressed: All Bots Report.");
-				supervisor.ReportAllBots();
+				Monitor.Log("F6 pressed: Bot persistence report.");
+				supervisor.ReportAllBotPersistenceState();
 				break;
 			case SButton.F7:
-				Monitor.Log("F7 pressed: Warp Local Bots to Me.");
+				Monitor.Log("F7 pressed: Recall bots home.");
 				supervisor.WarpSameLocationBotsToPlayer();
 				break;
 			case SButton.F8 when !e.IsDown(SButton.LeftShift):
@@ -158,8 +279,9 @@ namespace Farmtronics
 				Monitor.Log("F10: Mark all tasks done.");
 				break;	
 			case SButton.F11:
-				Monitor.Log("F11 pressed: stopping supervisor.");
-				supervisor.Stop();
+				Monitor.Log("F11 pressed: non-destructive bot safety scan/quarantine.");
+				//supervisor.Stop();
+				supervisor.PurgeExtraBotObjects();
 				break;			
 
 			}
@@ -179,6 +301,7 @@ namespace Farmtronics
 						if (item.Name == "Catalogue" || (index>0 && shop.forSale[index-1].Name == "Flooring")) break;
 					}
 					var botForSale = new BotObject();
+					botForSale.ResetIdentity("shop-stock");
 					botForSale.displayName = I18n.Bot_Name(BotManager.botCount);
 					botForSale.owner.Value = Game1.player.UniqueMultiplayerID;
 					shop.forSale.Insert(index, botForSale);
@@ -287,6 +410,7 @@ namespace Farmtronics
                         if (msg == "FarmtronicsFirstBotMail") {
                             Monitor.Log($"Changing recoveredItem from {Game1.player.recoveredItem} to Bot");
 							var bot = new BotObject();
+							bot.ResetIdentity("first-bot-mail-asset");
 							bot.displayName = I18n.Bot_Name(BotManager.botCount);
 							bot.owner.Value = Game1.player.UniqueMultiplayerID;
                             Game1.player.recoveredItem = bot;

@@ -123,6 +123,12 @@ namespace Farmtronics.Bot {
 				return;
             }
 			bot.shell.console.receiveKeyPress(key);
+			if (key == Keys.Delete && heldItem is BotObject heldBot) {
+				ModEntry.instance.Monitor.Log(
+					$"Bot persistence WARN: refused to trash held bot item {heldBot.name}.",
+					LogLevel.Warn);
+				return;
+			}
 			if (key == Keys.Delete && heldItem != null && heldItem.canBeTrashed()) {
 				Utility.trashItem(heldItem);
 				heldItem = null;
@@ -138,6 +144,13 @@ namespace Farmtronics.Bot {
 
 		public override void receiveLeftClick(int x, int y, bool playSound = true) {
 			bot.shell.console.receiveLeftClick(x, y, playSound);
+			if (heldItem is BotObject heldBot && trashCan.containsPoint(x, y))
+			{
+				ModEntry.instance.Monitor.Log(
+					$"Bot persistence WARN: refused to trash held bot item {heldBot.name}.",
+					LogLevel.Warn);
+				return;
+			}
 
 			// ModEntry.instance.Monitor.Log($"Bot.receiveLeftClick({x}, {y}, {playSound}) while heldItem={heldItem}; inDragArea={inDragArea(x,y)}");
 			int slot = botInventoryMenu.getInventoryPositionOfClick(x, y);

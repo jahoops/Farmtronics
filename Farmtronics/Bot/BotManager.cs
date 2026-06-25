@@ -1,4 +1,5 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Linq;
 using Farmtronics.Multiplayer.Messages;
 using Farmtronics.Utils;
@@ -19,6 +20,25 @@ namespace Farmtronics.Bot {
 		// Instances of bots which couldn't be located before (happens when a new player connects to the world)
 		// NOTE: 'OnDayStarted' triggers on connect for the new player, but it's still to early to find the bots on the map.
 		internal static List<AddBotInstance> lostInstances = new();
+
+		internal static bool IsTracked(BotObject bot) {
+			if (bot == null) return false;
+			if (instances.Any(existing => ReferenceEquals(existing, bot))) return true;
+			return remoteInstances.Values.Any(playerBots => playerBots.Any(existing => ReferenceEquals(existing, bot)));
+		}
+
+		internal static void RegisterLocalBot(BotObject bot, string reason = null) {
+			if (bot == null) return;
+			if (instances.Any(existing => ReferenceEquals(existing, bot))) return;
+
+			if (instances.Any(existing => existing != null && string.Equals(existing.name, bot.name, StringComparison.OrdinalIgnoreCase))) {
+				ModEntry.instance.Monitor.Log(
+					$"Bot persistence WARN: registering duplicate-name local bot {bot.name}; reason={reason ?? "(none)"}.",
+					LogLevel.Warn);
+			}
+
+			instances.Add(bot);
+		}
 		
 		public static void FindLostInstances(object sender, OneSecondUpdateTickingEventArgs args) {
 			if (lostInstances.Count == 0) return;
@@ -155,7 +175,12 @@ namespace Farmtronics.Bot {
 			count += playerBotCount;
 
 			// And watch out for a recoveredItem (mail attachment).
-			if (Game1.player.recoveredItem is BotObject) Game1.player.recoveredItem = null;
+			if (Game1.player.recoveredItem is BotObject recoveredBot) {
+				ModEntry.instance.Monitor.Log(
+					$"Bot persistence WARN: converting recovered bot item {recoveredBot.name} to safe chest serialization instead of dropping it.",
+					LogLevel.Warn);
+				Game1.player.recoveredItem = ConvertBotToChest(recoveredBot, saving);
+			}
 
 			//ModEntry.instance.Monitor.Log($"Total bots converted to chests: {count}");
 		}
@@ -223,7 +248,13 @@ namespace Farmtronics.Bot {
 			}
 			foreach (var tileLoc in targetTileLocs) {
 				//ModEntry.instance.Monitor.Log($"Found bot in {inLocation.Name} at {tileLoc}; converting");
-				var chest = ConvertBotToChest(inLocation.getObjectAtTile(tileLoc.GetIntX(), tileLoc.GetIntY()) as BotObject, saving);
+				if (inLocation.getObjectAtTile(tileLoc.GetIntX(), tileLoc.GetIntY()) is not BotObject bot) {
+					ModEntry.instance.Monitor.Log(
+						$"Bot persistence WARN: expected bot during save conversion but found none at {inLocation.NameOrUniqueName} {tileLoc.X},{tileLoc.Y}.",
+						LogLevel.Warn);
+					continue;
+				}
+				var chest = ConvertBotToChest(bot, saving);
 				inLocation.removeObject(tileLoc, false);
 				inLocation.setObject(tileLoc, chest);
 				countInLoc++;
@@ -273,6 +304,7 @@ namespace Farmtronics.Bot {
 			
 			chest.Items.Clear();
 			bot.displayName = bot.data.Name;
+			bot.data.Update();
 			botCount++;
 			
 			return bot;
@@ -284,45 +316,53 @@ namespace Farmtronics.Bot {
 		/// <param name="inLocation">Location to search in, or if null, search all locations</param>
 		static void ConvertChestsInMapToBots(GameLocation inLocation = null) {
 			if (inLocation == null) {
+				// Share one seenNames across all locations so duplicates are caught globally.
+				var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 				foreach (var loc in Game1.locations) {
-					//ModEntry.instance.Monitor.Log($"Converting in location: {loc}");
-					ConvertChestsInMapToBots(loc);
+					ConvertChestsInMapToBots(loc, seenNames);
 				}
 				return;
 			}
+			ConvertChestsInMapToBots(inLocation, new HashSet<string>(StringComparer.OrdinalIgnoreCase));
+		}
+
+		static void ConvertChestsInMapToBots(GameLocation inLocation, HashSet<string> seenNames) {
 			int count = 0;
 			var targetTileLocs = new List<Vector2>();
 			foreach (var kv in inLocation.objects.Pairs) {
 				var tileLoc = kv.Key;
 				var chest = kv.Value as Chest;
 				if (chest == null) continue;
-				int inChestCount = ConvertChestsInListToBots(chest.Items);
-				//if (inChestCount > 0) ModEntry.instance.Monitor.Log($"Converted {inChestCount} chests stored in a chest into bots");
-
+				ConvertChestsInListToBots(chest.Items);
 				if (!ModData.IsBotData(chest.modData)) continue;
 				targetTileLocs.Add(tileLoc);
 			}
 			foreach (Vector2 tileLoc in targetTileLocs) {
 				var chest = inLocation.getObjectAtTile(tileLoc.GetIntX(), tileLoc.GetIntY()) as Chest;
 				var bot = ConvertChestToBot(chest, tileLoc, inLocation);
-				
-				inLocation.removeObject(tileLoc, false);             // remove chest from "objects"
-				inLocation.setObject(tileLoc, bot);    // add bot to "objects"
 
-				if (bot.owner.Value == Game1.player.UniqueMultiplayerID) BotManager.instances.Add(bot);
-				else if (ModEntry.instance.Helper.Multiplayer.GetConnectedPlayer(bot.owner.Value) != null) AddBotInstance.Send(bot);
+				inLocation.removeObject(tileLoc, false);
+				inLocation.setObject(tileLoc, bot);
+
+				if (bot.owner.Value == Game1.player.UniqueMultiplayerID) {
+					if (!seenNames.Add(bot.data.Name)) {
+						ModEntry.instance.Monitor.Log(
+							$"Bot persistence WARN: duplicate bot name after load: {bot.data.Name}; registering and leaving supervisor to quarantine/separate if needed.",
+							LogLevel.Warn);
+						bot.modData[ModEntry.GetModDataKey("duplicateName")] = "true";
+					}
+					BotManager.RegisterLocalBot(bot, "load conversion");
+				} else if (ModEntry.instance.Helper.Multiplayer.GetConnectedPlayer(bot.owner.Value) != null)
+					AddBotInstance.Send(bot);
 				else {
 					ModEntry.instance.Monitor.Log($"Adding bot to remote instances for playerID: {bot.owner.Value}");
-					if (!BotManager.remoteInstances.ContainsKey(bot.owner.Value)) BotManager.remoteInstances.Add(bot.owner.Value, new());
+					if (!BotManager.remoteInstances.ContainsKey(bot.owner.Value))
+						BotManager.remoteInstances.Add(bot.owner.Value, new());
 					BotManager.remoteInstances[bot.owner.Value].Add(bot);
 				}
-
 				count++;
-				//ModEntry.instance.Monitor.Log($"Converted {chest} to {bot} at {tileLoc} of {inLocation}");
 			}
-			//if (count > 0) ModEntry.instance.Monitor.Log($"Converted {count} chests to bots in {inLocation}");
 		}
-
 		/// <summary>
 		/// Convert all chests (with appropriate metadata) in the given item list into bots.
 		/// </summary>

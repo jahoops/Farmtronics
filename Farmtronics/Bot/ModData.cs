@@ -21,6 +21,10 @@ namespace Farmtronics.Bot {
 		public string 			Name		{ get; internal set; }
 		public float			Energy		{ get; internal set; }
 		public int 				Facing		{ get; internal set; }
+		public string			BotGuid		{ get; internal set; }
+		public long				CreatedTick	{ get; internal set; }
+		public string			CreatedFrom	{ get; internal set; }
+		public bool				IsQuarantined { get; internal set; }
 		// New with 1.3.0
 		public IList<Item>		Inventory	{ get; internal set; }
 
@@ -77,6 +81,12 @@ namespace Farmtronics.Bot {
 			Name = GetModDataValue(bot.modData, nameof(Name), I18n.Bot_Name(BotManager.botCount));
 			Energy = GetModDataValue<float>(bot.modData, nameof(Energy), Farmer.startingStamina);
 			Facing = GetModDataValue<int>(bot.modData, nameof(Facing));
+			BotGuid = GetModDataValue(bot.modData, nameof(BotGuid), "");
+			if (string.IsNullOrWhiteSpace(BotGuid)) BotGuid = Guid.NewGuid().ToString("N");
+			CreatedTick = GetModDataValue<long>(bot.modData, nameof(CreatedTick), 0);
+			if (CreatedTick <= 0) CreatedTick = (long)(Game1.stats?.DaysPlayed ?? 0) * 1000000L + Game1.ticks;
+			CreatedFrom = GetModDataValue(bot.modData, nameof(CreatedFrom), "");
+			IsQuarantined = GetModDataValue<int>(bot.modData, nameof(IsQuarantined), 0) == 1;
 			Inventory = DeserializeInventory(GetModDataValue(bot.modData, nameof(Inventory)));
 			
 			ScreenColor = GetModDataValue(bot.modData, nameof(ScreenColor), Color.Transparent.ToHexString()).ToColor();
@@ -114,6 +124,10 @@ namespace Farmtronics.Bot {
 			saveData.Add(ModEntry.GetModDataKey(nameof(Name).FirstToLower()), Name);
 			saveData.Add(ModEntry.GetModDataKey(nameof(Energy).FirstToLower()), Energy.ToString());
 			saveData.Add(ModEntry.GetModDataKey(nameof(Facing).FirstToLower()), Facing.ToString());
+			saveData.Add(ModEntry.GetModDataKey(nameof(BotGuid).FirstToLower()), BotGuid);
+			saveData.Add(ModEntry.GetModDataKey(nameof(CreatedTick).FirstToLower()), CreatedTick.ToString());
+			saveData.Add(ModEntry.GetModDataKey(nameof(CreatedFrom).FirstToLower()), CreatedFrom ?? "");
+			saveData.Add(ModEntry.GetModDataKey(nameof(IsQuarantined).FirstToLower()), IsQuarantined ? "1" : "0");
 			saveData.Add(ModEntry.GetModDataKey(nameof(Inventory).FirstToLower()), SerializeInventory(Inventory));
 
 			if (!isSaving) {
@@ -161,6 +175,10 @@ namespace Farmtronics.Bot {
 			Name = bot.Name;
 			Energy = bot.energy;
 			Facing = bot.facingDirection;
+			BotGuid = bot.BotGuid;
+			CreatedTick = bot.CreatedTick;
+			CreatedFrom = bot.CreatedFrom;
+			IsQuarantined = bot.IsQuarantined;
 			Inventory = bot.inventory;
 
 			ScreenColor = bot.screenColor;
