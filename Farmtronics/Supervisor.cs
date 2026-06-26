@@ -32,6 +32,7 @@ namespace Farmtronics {
             TillSoil,
             MineBreakStone,
             MineCutWeeds,
+            MineDigFloor,
         }
         private enum SupervisorMode
         {
@@ -87,6 +88,7 @@ namespace Farmtronics {
         {
             public BotCapability Capabilities { get; set; }
             public HashSet<string> AllowedZones { get; } = new(StringComparer.OrdinalIgnoreCase);
+            public HashSet<string> AllowedMachines { get; } = new(StringComparer.OrdinalIgnoreCase);
             public BotOrderMode Mode { get; set; } = BotOrderMode.Work;
             public bool HasCapabilityOverride { get; set; }
         }
@@ -218,28 +220,153 @@ namespace Farmtronics {
             if (bot == null)
                 return false;
 
-            bool hasAnyTool =
-            bot.inventory.Any(item =>
-                item is Tool);
-            if (!hasAnyTool)
-            {
-                ModEntry.instance.Monitor.Log("Bot report: bot has no tools, giving tools");
-                bot.farmer.Items.AddRange(Farmer.initialTools());
-
-                // Inventory indices have to exist, since InventoryMenu exclusively uses them and can't assign items otherwise.
-                for (int i = bot.farmer.Items.Count; i < bot.GetActualCapacity(); i++) {
-                    bot.farmer.Items.Add(null);
-                }
-            }
-            hasAnyTool =
-            bot.inventory.Any(item =>
-                item is Tool);
-            if (!hasAnyTool)
-            {
-                ModEntry.instance.Monitor.Log("Bot report: bot has no tools, giving tools didn't work");
+            if (bot.farmer == null || bot.inventory == null)
                 return false;
-            }
+
+            EnsureInventorySlots(bot);
+            SyncToolsForOrders(bot, GetOrdersForBot(bot));
             return true;
+        }
+
+        private static bool RequiresNormalTools(BotOrders orders)
+        {
+            if (orders == null)
+                return false;
+
+            const BotCapability nonMachineCapabilities =
+                BotCapability.Harvest
+                | BotCapability.Water
+                | BotCapability.Plant
+                | BotCapability.Fertilize
+                | BotCapability.Till
+                | BotCapability.Clear
+                | BotCapability.Mine;
+
+            return (orders.Capabilities & nonMachineCapabilities) != 0;
+        }
+
+        private static void EnsureInventorySlots(BotObject bot)
+        {
+            if (bot?.farmer?.Items == null)
+                return;
+
+            for (int i = bot.farmer.Items.Count; i < bot.GetActualCapacity(); i++)
+                bot.farmer.Items.Add(null);
+        }
+
+        private void SyncToolsForOrders(BotObject bot, BotOrders orders)
+        {
+            if (bot?.farmer?.Items == null || orders == null)
+                return;
+
+            if (RequiresNormalTools(orders))
+            {
+                EnsureToolsForOrders(bot, orders);
+                return;
+            }
+
+            if ((orders.Capabilities & BotCapability.Machines) != 0)
+                RemoveStarterToolsForMachineOnlyBot(bot);
+        }
+
+        private void EnsureToolsForOrders(BotObject bot, BotOrders orders)
+        {
+            if (bot?.farmer?.Items == null || !RequiresNormalTools(orders))
+                return;
+
+            EnsureInventorySlots(bot);
+
+            bool addedAnyTool = false;
+            foreach (Item starterTool in Farmer.initialTools())
+            {
+                if (starterTool == null || BotHasEquivalentTool(bot, starterTool))
+                    continue;
+
+                if (!TryAddItemToBotInventory(bot, starterTool))
+                {
+                    ModEntry.instance.Monitor.Log(
+                        $"Tool provisioning skipped for {bot.name}: no empty slot for {starterTool.Name}.",
+                        LogLevel.Warn);
+                    continue;
+                }
+
+                addedAnyTool = true;
+            }
+
+            if (addedAnyTool)
+            {
+                bot.data.Update();
+                ModEntry.instance.Monitor.Log(
+                    $"Issued normal starter tools to {bot.name} for non-machine work.",
+                    LogLevel.Warn);
+            }
+        }
+
+        private void RemoveStarterToolsForMachineOnlyBot(BotObject bot)
+        {
+            if (bot?.farmer?.Items == null)
+                return;
+
+            var starterTools = Farmer.initialTools().Where(item => item is Tool).ToList();
+            bool removedAnyTool = false;
+            for (int i = 0; i < bot.farmer.Items.Count; i++)
+            {
+                Item item = bot.farmer.Items[i];
+                if (item == null)
+                    continue;
+
+                if (!starterTools.Any(starterTool => IsEquivalentTool(item, starterTool)))
+                    continue;
+
+                bot.farmer.Items[i] = null;
+                removedAnyTool = true;
+            }
+
+            if (removedAnyTool)
+            {
+                bot.data.Update();
+                ModEntry.instance.Monitor.Log(
+                    $"Removed normal starter tools from machine-only bot {bot.name}.",
+                    LogLevel.Warn);
+            }
+        }
+
+        private static bool BotHasEquivalentTool(BotObject bot, Item starterTool)
+        {
+            return bot?.farmer?.Items?.Any(item =>
+                IsEquivalentTool(item, starterTool)) == true;
+        }
+
+        private static bool IsEquivalentTool(Item item, Item starterTool)
+        {
+            return item != null
+                && starterTool != null
+                && item is Tool
+                && item.GetType() == starterTool.GetType()
+                && string.Equals(item.Name, starterTool.Name, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static bool TryAddItemToBotInventory(BotObject bot, Item item)
+        {
+            if (bot?.farmer?.Items == null || item == null)
+                return false;
+
+            for (int i = 0; i < bot.farmer.Items.Count; i++)
+            {
+                if (bot.farmer.Items[i] != null)
+                    continue;
+
+                bot.farmer.Items[i] = item;
+                return true;
+            }
+
+            if (bot.farmer.Items.Count < bot.GetActualCapacity())
+            {
+                bot.farmer.Items.Add(item);
+                return true;
+            }
+
+            return false;
         }
 
         private void LoadBotStatesToSupervisor(bool singleBot = false)
@@ -341,12 +468,16 @@ namespace Farmtronics {
                 case "mining":
                     capability = BotCapability.Mine;
                     return true;
+                case "all_machines":
+                case "all-machines":
+                case "allmachines":
                 case "machines":
                 case "machine":
                     capability = BotCapability.Machines;
                     return true;
                 case "kegs":
                 case "keg":
+                case "wine":
                     capability = BotCapability.Kegs;
                     return true;
                 case "jars":
@@ -365,6 +496,11 @@ namespace Farmtronics {
                     capability = BotCapability.Furnaces;
                     return true;
                 default:
+                    if (TryGetAllowedMachinesForRoleToken(text, out _))
+                    {
+                        capability = BotCapability.Machines;
+                        return true;
+                    }
                     return false;
             }
         }
@@ -380,10 +516,23 @@ namespace Farmtronics {
 
             BotCapability capabilities = BotCapability.None;
             var unknown = new List<string>();
+            var allowedMachines = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            bool allowAllMachines = false;
             foreach (var name in capabilityNames ?? Enumerable.Empty<string>())
             {
                 if (TryParseCapability(name, out var capability))
+                {
                     capabilities |= capability;
+                    if (TryGetAllowedMachinesForRoleToken(name, out var tokenMachines))
+                    {
+                        foreach (string machineName in tokenMachines)
+                            allowedMachines.Add(machineName);
+                    }
+                    else if (IsAllMachinesToken(name))
+                    {
+                        allowAllMachines = true;
+                    }
+                }
                 else
                     unknown.Add(name);
             }
@@ -398,10 +547,17 @@ namespace Farmtronics {
 
             var orders = GetMutableOrders(botName);
             orders.Capabilities = ExpandMachineCapabilities(capabilities);
+            orders.AllowedMachines.Clear();
+            if (!allowAllMachines)
+            {
+                foreach (string machineName in allowedMachines)
+                    orders.AllowedMachines.Add(machineName);
+            }
             orders.HasCapabilityOverride = true;
             var state = FindBotStateByName(botName);
             if (state?.Bot != null)
             {
+                SyncToolsForOrders(state.Bot, orders);
                 ClearBotScriptQueue(state.Bot);
                 ClearCurrentPlan(state);
                 state.Mode = BotMode.Planning;
@@ -409,7 +565,7 @@ namespace Farmtronics {
                 state.LastNoPlanReason = "Bot role changed.";
             }
             ModEntry.instance.Monitor.Log(
-                $"Orders updated for {botName}: capabilities={FormatCapabilities(orders.Capabilities)}.",
+                $"Orders updated for {botName}: capabilities={FormatCapabilities(orders.Capabilities)} machines={FormatMachines(orders)}.",
                 LogLevel.Warn);
         }
 
@@ -538,7 +694,7 @@ namespace Farmtronics {
             var orders = GetOrdersForBot(bot?.name ?? botName);
 
             ModEntry.instance.Monitor.Log(
-                $"Bot status {botName}: loc={bot?.currentLocation?.NameOrUniqueName ?? "(unknown)"} tile={bot?.TileLocation.X},{bot?.TileLocation.Y} supervisorMode={state?.Mode.ToString() ?? "(untracked)"} orderMode={orders.Mode} capabilities={FormatCapabilities(orders.Capabilities)} zones={FormatZones(orders)} idleReason={state?.LastNoPlanReason ?? "(none)"} currentPlan={DescribePlan(state?.CurrentPlan)}.",
+                $"Bot status {botName}: loc={bot?.currentLocation?.NameOrUniqueName ?? "(unknown)"} tile={bot?.TileLocation.X},{bot?.TileLocation.Y} supervisorMode={state?.Mode.ToString() ?? "(untracked)"} orderMode={orders.Mode} capabilities={FormatCapabilities(orders.Capabilities)} machines={FormatMachines(orders)} zones={FormatZones(orders)} idleReason={state?.LastNoPlanReason ?? "(none)"} currentPlan={DescribePlan(state?.CurrentPlan)}.",
                 LogLevel.Warn);
         }
 
@@ -626,6 +782,8 @@ namespace Farmtronics {
             if (TryGetAllowedMachinesForBot(botName, out var allowedMachines))
             {
                 orders.Capabilities = CapabilitiesForMachines(allowedMachines);
+                foreach (string machineName in allowedMachines)
+                    orders.AllowedMachines.Add(machineName);
             }
 
             return orders;
@@ -662,6 +820,35 @@ namespace Farmtronics {
             return orders == null || orders.AllowedZones.Count == 0
                 ? "(default/current location)"
                 : string.Join(",", orders.AllowedZones.OrderBy(zone => zone));
+        }
+
+        private static string FormatMachines(BotOrders orders)
+        {
+            if (orders == null || (orders.Capabilities & BotCapability.Machines) == 0)
+                return "(none)";
+
+            if (orders.AllowedMachines.Count > 0)
+                return string.Join(",", orders.AllowedMachines.OrderBy(machine => machine));
+
+            bool hasSpecificMachineCapabilities =
+                (orders.Capabilities & (BotCapability.Kegs | BotCapability.Jars | BotCapability.SeedMakers | BotCapability.Furnaces)) != 0;
+            if (!hasSpecificMachineCapabilities)
+                return "all";
+
+            var machines = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            if ((orders.Capabilities & BotCapability.Kegs) != 0)
+                machines.Add("Keg");
+            if ((orders.Capabilities & BotCapability.Jars) != 0)
+                machines.Add("Preserves Jar");
+            if ((orders.Capabilities & BotCapability.SeedMakers) != 0)
+                machines.Add("Seed Maker");
+            if ((orders.Capabilities & BotCapability.Furnaces) != 0)
+            {
+                machines.Add("Furnace");
+                machines.Add("Charcoal Kiln");
+            }
+
+            return string.Join(",", machines.OrderBy(machine => machine));
         }
 
         private static string DescribePlan(PendingPlan plan)
@@ -774,13 +961,8 @@ namespace Farmtronics {
 
             autoPausedTonight = true;
 
-            if (Game1.activeClickableMenu != null)
-                return;
-
-            Game1.activeClickableMenu = new StardewValley.Menus.GameMenu();
-
             ModEntry.instance.Monitor.Log(
-                $"Auto-pause: opened menu at time {Game1.timeOfDay}.",
+                $"Auto-pause skipped at time {Game1.timeOfDay}; direct menu opens during save/night transitions can unbalance UI mode.",
                 LogLevel.Warn);
         }
 
@@ -986,7 +1168,7 @@ namespace Farmtronics {
                 return;
             }
 
-            if (plan.JobType == JobType.TillSoil && GetBotTile(bot) != plan.StandTile)
+            if ((plan.JobType == JobType.TillSoil || plan.JobType == JobType.MineDigFloor) && GetBotTile(bot) != plan.StandTile)
             {
                 ModEntry.instance.Monitor.Log(
                     $"Supervisor: {bot.name} drifted from expected stand tile for {plan.JobType}. " +
@@ -1324,14 +1506,32 @@ namespace Farmtronics {
                         continue;
                     }
 
-                    if (TryBuildTillSoilJob(mine, tile, out BotJob mineTillJob, basePriority: 250, targetName: "Mine Floor"))
+                    if (TryBuildMineDigFloorJob(mine, tile, out BotJob mineDigJob))
                     {
-                        jobs.Add(mineTillJob);
+                        jobs.Add(mineDigJob);
                     }
                 }
             }
 
             return jobs;
+        }
+        private bool TryBuildMineDigFloorJob(MineShaft mine, Vector2 tile, out BotJob job)
+        {
+            if (TryBuildTillSoilJob(mine, tile, out job, basePriority: 250, targetName: "Mine Floor"))
+            {
+                job = new BotJob
+                {
+                    Type = JobType.MineDigFloor,
+                    JobKey = GetJobKey(mine, JobType.MineDigFloor, tile),
+                    TargetName = "Mine Floor",
+                    TargetTile = job.TargetTile,
+                    AdjacentTile = job.AdjacentTile,
+                    BasePriority = job.BasePriority,
+                };
+                return true;
+            }
+
+            return false;
         }
         private List<BotJob> BuildFarmJobs(GameLocation location, BotSupervisorState state)
         {
@@ -1340,47 +1540,16 @@ namespace Farmtronics {
             int width = location.map.Layers[0].LayerWidth;
             int height = location.map.Layers[0].LayerHeight;
 
-            bool isGreenhouse = location.NameOrUniqueName == "Greenhouse";
-            
-
-            if(isGreenhouse){
-                for (int y = 10; y < 20; y++)
+            for (int y = 0; y < height; y++)
+            {
+                for (int x = 0; x < width; x++)
                 {
-                    for (int x = 3; x < 16; x++)
-                    {
-                        var tile = new Vector2(x, y);
-                        if(TryGetFarmJob(location, tile, state, out BotJob farmJob)) {
-                            jobs.Add(farmJob);
-                        }
-                    }
-                }
-            } else {
-                    // Machine Area
-                for (int y = 10; y < 22; y++)
-                {
-                    for (int x = 16; x < width; x++)
-                    {
-                        var tile = new Vector2(x, y);
-                        TimeSpan timestamp = new TimeSpan(DateTime.Now.Ticks);
-                        if (TryBuildMachineJob(location, tile, timestamp,  out BotJob machineJob)) {
-                            jobs.Add(machineJob);
-                            continue;
-                        }  
-                    }
-                }
-                    // Crop Area
-                for (int y = 22; y < height-4; y++)
-                {
-                    for (int x = 26; x < width; x++)
-                    {
-                        var tile = new Vector2(x, y);
-                        if(TryGetFarmJob(location, tile, state, out BotJob farmJob)) {
-                            jobs.Add(farmJob);
-                        }
-                    }  
-
+                    var tile = new Vector2(x, y);
+                    if (TryGetFarmJob(location, tile, state, out BotJob farmJob))
+                        jobs.Add(farmJob);
                 }
             }
+
             return jobs;
         }
         private static string GetJobKey(GameLocation location, JobType type, Vector2 tile)
@@ -1405,6 +1574,7 @@ namespace Farmtronics {
                 JobType.ServiceMachine => IsExpectedMachine(location, plan.TargetTile, plan.TargetName),
                 JobType.MineBreakStone => IsNamedObjectTile(location, plan.TargetTile, "Stone"),
                 JobType.MineCutWeeds => IsNamedObjectTile(location, plan.TargetTile, "Weeds"),
+                JobType.MineDigFloor => IsStillTillable(location, plan.TargetTile),
                 _ => false,
             };
         }
@@ -1659,6 +1829,8 @@ namespace Farmtronics {
                 return BotHasMachineInput(bot, job);
             }
 
+            EnsureToolsForOrders(bot, orders);
+
             if (job.Type == JobType.PlantCrop && !BotHasSeasonSafeSeed(bot))
                 return false;
 
@@ -1669,6 +1841,7 @@ namespace Farmtronics {
                 JobType.PlantCrop => BotHasInventoryCategory(bot, "Seed"),
                 JobType.WaterCrop => BotHasToolType(bot, "WateringCan"),
                 JobType.TillSoil => BotHasToolType(bot, "Hoe"),
+                JobType.MineDigFloor => BotHasToolType(bot, "Hoe"),
                 JobType.MineBreakStone => BotHasToolType(bot, "Pickaxe"),
                 _ => true,
             };
@@ -1693,6 +1866,7 @@ namespace Farmtronics {
                     || (state?.Bot?.currentLocation is MineShaft && (orders.Capabilities & BotCapability.Mine) != 0),
                 JobType.MineBreakStone => (orders.Capabilities & BotCapability.Mine) != 0,
                 JobType.MineCutWeeds => (orders.Capabilities & (BotCapability.Mine | BotCapability.Clear)) != 0,
+                JobType.MineDigFloor => (orders.Capabilities & BotCapability.Mine) != 0,
                 JobType.ServiceMachine => IsMachineAllowedByOrders(job.TargetName, orders),
                 _ => false,
             };
@@ -1717,6 +1891,14 @@ namespace Farmtronics {
             if ((orders.Capabilities & BotCapability.Machines) == 0)
                 return false;
 
+            if (orders.AllowedMachines.Count > 0)
+                return orders.AllowedMachines.Contains(machineName);
+
+            bool hasSpecificMachineCapabilities =
+                (orders.Capabilities & (BotCapability.Kegs | BotCapability.Jars | BotCapability.SeedMakers | BotCapability.Furnaces)) != 0;
+            if (!hasSpecificMachineCapabilities)
+                return true;
+
             return machineName switch
             {
                 "Keg" => (orders.Capabilities & BotCapability.Kegs) != 0,
@@ -1724,7 +1906,7 @@ namespace Farmtronics {
                 "Seed Maker" => (orders.Capabilities & BotCapability.SeedMakers) != 0,
                 "Furnace" => (orders.Capabilities & BotCapability.Furnaces) != 0,
                 "Charcoal Kiln" => (orders.Capabilities & BotCapability.Furnaces) != 0,
-                _ => (orders.Capabilities & BotCapability.Machines) != 0,
+                _ => false,
             };
         }
 
@@ -1744,6 +1926,10 @@ namespace Farmtronics {
 
                 if (!string.IsNullOrWhiteSpace(input.Category) &&
                     BotHasInventoryCategory(bot, input.Category))
+                    return true;
+
+                if (!string.IsNullOrWhiteSpace(input.EndsWith) &&
+                    BotHasInventoryNameEndingWith(bot, input.EndsWith))
                     return true;
             }
             return false;
@@ -1769,6 +1955,24 @@ namespace Farmtronics {
 
             return false;
         }
+
+        private bool BotHasInventoryNameEndingWith(BotObject bot, string suffix)
+        {
+            if (bot?.farmer == null)
+                return false;
+
+            foreach (Item item in bot.farmer.Items)
+            {
+                if (item == null) continue;
+
+                if ((item.Name?.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) ?? false)
+                    || (item.DisplayName?.EndsWith(suffix, StringComparison.OrdinalIgnoreCase) ?? false))
+                    return true;
+            }
+
+            return false;
+        }
+
         private bool BotHasInventoryCategory(BotObject bot, string category)
         {
             if (bot?.farmer == null)
@@ -2027,6 +2231,38 @@ namespace Farmtronics {
                 {
                     new MachineInputRule { Category = "Vegetable" },
                     new MachineInputRule { Category = "Fruit" },
+                }
+            },
+            new()
+            {
+                MachineName = "Loom",
+                BasePriority = 550,
+                InputRules =
+                {
+                    new MachineInputRule { Name = "Wool" },
+                }
+            },
+            new()
+            {
+                MachineName = "Oil Maker",
+                BasePriority = 550,
+                InputRules =
+                {
+                    new MachineInputRule { Name = "Truffle" },
+                    new MachineInputRule { Name = "Sunflower" },
+                    new MachineInputRule { Name = "Sunflower Seeds" },
+                    new MachineInputRule { Name = "Corn" },
+                }
+            },
+            new()
+            {
+                MachineName = "Crystalarium",
+                BasePriority = 550,
+                InputRules =
+                {
+                    new MachineInputRule { Category = "Gem" },
+                    new MachineInputRule { Category = "Mineral" },
+                    new MachineInputRule { Category = "Minerals" },
                 }
             },
             new()
@@ -2383,6 +2619,7 @@ namespace Farmtronics {
             return plan.JobType switch
             {
                 JobType.TillSoil => IsStillTillable(bot.currentLocation, plan.TargetTile),
+                JobType.MineDigFloor => IsStillTillable(bot.currentLocation, plan.TargetTile),
                 JobType.ClearDebris => IsClearableTile(bot.currentLocation, plan.TargetTile, out _),
                 JobType.WaterCrop => IsDryCropTile(bot.currentLocation, plan.TargetTile),
                 JobType.HarvestCrop => IsHarvestableCropTile(bot.currentLocation, plan.TargetTile, out _),
@@ -2586,6 +2823,17 @@ namespace Farmtronics {
                 "        return false",
                 "    end function",
                 "",
+                "    selectInventoryByNameEndingWith = function(suffix)",
+                "        for i in range(0,11)",
+                "            item = me.inventory[i]",
+                "            if item and item.hasIndex(\"name\") and item.name.len >= suffix.len and item.name[-suffix.len:] == suffix then",
+                "                me.select i",
+                "                return true",
+                "            end if",
+                "        end for",
+                "        return false",
+                "    end function",
+                "",
                 "    selectInventoryByCategory = function(cat=\"Fertilizer\")",
                 "        for i in range(0,11)",
                 "            item = me.inventory[i]",
@@ -2717,7 +2965,82 @@ private static void AddPlantCropAction(List<string> lines, BotJob job)
 private static readonly Dictionary<string, HashSet<string>> BotMachineRoles =
     new(StringComparer.OrdinalIgnoreCase)
 {
+    ["all_machines"] = new()
+    {
+        "Keg",
+        "Preserves Jar",
+        "Seed Maker",
+        "Furnace",
+        "Charcoal Kiln",
+        "Mayonnaise Machine",
+        "Cheese Press",
+        "Loom",
+        "Oil Maker",
+        "Crystalarium"
+    },
+
+    ["all-machines"] = new()
+    {
+        "Keg",
+        "Preserves Jar",
+        "Seed Maker",
+        "Furnace",
+        "Charcoal Kiln",
+        "Mayonnaise Machine",
+        "Cheese Press",
+        "Loom",
+        "Oil Maker",
+        "Crystalarium"
+    },
+
+    ["allmachines"] = new()
+    {
+        "Keg",
+        "Preserves Jar",
+        "Seed Maker",
+        "Furnace",
+        "Charcoal Kiln",
+        "Mayonnaise Machine",
+        "Cheese Press",
+        "Loom",
+        "Oil Maker",
+        "Crystalarium"
+    },
+
+    ["machine"] = new()
+    {
+        "Keg",
+        "Preserves Jar",
+        "Seed Maker",
+        "Furnace",
+        "Charcoal Kiln",
+        "Mayonnaise Machine",
+        "Cheese Press",
+        "Loom",
+        "Oil Maker",
+        "Crystalarium"
+    },
+
+    ["machines"] = new()
+    {
+        "Keg",
+        "Preserves Jar",
+        "Seed Maker",
+        "Furnace",
+        "Charcoal Kiln",
+        "Mayonnaise Machine",
+        "Cheese Press",
+        "Loom",
+        "Oil Maker",
+        "Crystalarium"
+    },
+
     ["keg"] = new()
+    {
+        "Keg"
+    },
+
+    ["kegs"] = new()
     {
         "Keg"
     },
@@ -2728,6 +3051,11 @@ private static readonly Dictionary<string, HashSet<string>> BotMachineRoles =
     },
 
     ["jar"] = new()
+    {
+        "Preserves Jar"
+    },
+
+    ["jars"] = new()
     {
         "Preserves Jar"
     },
@@ -2750,6 +3078,16 @@ private static readonly Dictionary<string, HashSet<string>> BotMachineRoles =
     },
 
     ["seed"] = new()
+    {
+        "Seed Maker"
+    },
+
+    ["seedmaker"] = new()
+    {
+        "Seed Maker"
+    },
+
+    ["seedmakers"] = new()
     {
         "Seed Maker"
     },
@@ -2784,8 +3122,59 @@ private static readonly Dictionary<string, HashSet<string>> BotMachineRoles =
     ["furnace"] = new()
     {
         "Furnace"
+    },
+
+    ["furnaces"] = new()
+    {
+        "Furnace",
+        "Charcoal Kiln"
+    },
+
+    ["loom"] = new()
+    {
+        "Loom"
+    },
+
+    ["oil"] = new()
+    {
+        "Oil Maker"
+    },
+
+    ["oilmaker"] = new()
+    {
+        "Oil Maker"
+    },
+
+    ["crystal"] = new()
+    {
+        "Crystalarium"
+    },
+
+    ["crystalarium"] = new()
+    {
+        "Crystalarium"
     }
 };
+
+private static bool IsAllMachinesToken(string text)
+{
+    string normalized = (text ?? "").Trim();
+    return string.Equals(normalized, "all_machines", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(normalized, "all-machines", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(normalized, "allmachines", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(normalized, "machines", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(normalized, "machine", StringComparison.OrdinalIgnoreCase);
+}
+
+private static bool TryGetAllowedMachinesForRoleToken(string text, out HashSet<string> allowedMachines)
+{
+    allowedMachines = null;
+    string normalized = (text ?? "").Trim();
+    if (IsAllMachinesToken(normalized))
+        return false;
+
+    return BotMachineRoles.TryGetValue(normalized, out allowedMachines);
+}
 
 private static bool TryGetAllowedMachinesForBot(
     string botName,
@@ -2854,6 +3243,10 @@ private static void AddServiceMachineAction(List<string> lines, BotJob job)
         else if (!string.IsNullOrWhiteSpace(input.Name))
         {
             lines.Add($"{prefix}selectInventoryByName(\"{EscapeMiniScript(input.Name)}\") then");
+        }
+        else if (!string.IsNullOrWhiteSpace(input.EndsWith))
+        {
+            lines.Add($"{prefix}selectInventoryByNameEndingWith(\"{EscapeMiniScript(input.EndsWith)}\") then");
         }
         else
         {
@@ -2930,6 +3323,7 @@ private static void AddAheadSafetyCheck(List<string> lines, BotJob job)
 
         case JobType.PlantCrop:
         case JobType.TillSoil:
+        case JobType.MineDigFloor:
             AddLines(lines,
                 "    if ahead and ahead.hasIndex(\"type\") and ahead.type != \"unknown\" and ahead.type != \"HoeDirt\" then",
                 "        print \"Safety refused: ground target is occupied\"",
@@ -3037,6 +3431,9 @@ private static void AddScriptFooter(List<string> lines)
                     break;
                 case JobType.MineCutWeeds:
                     AddMineCutWeedsAction(lines);
+                    break;
+                case JobType.MineDigFloor:
+                    AddMineDigFloorAction(lines);
                     break;
 
                 default:
@@ -3236,12 +3633,33 @@ private static void AddScriptFooter(List<string> lines)
             foreach (var location in Game1.locations)
                 AddLocation(location);
 
+            foreach (var farm in Game1.locations.OfType<Farm>())
+            {
+                foreach (var building in farm.buildings)
+                    AddLocation(GetBuildingIndoorLocation(building));
+            }
+
             AddLocation(Game1.player?.currentLocation);
 
             foreach (var bot in BotManager.GetAllBots().Where(bot => bot != null))
                 AddLocation(bot.currentLocation);
 
             return locations;
+        }
+
+        private static GameLocation GetBuildingIndoorLocation(Building building)
+        {
+            if (building == null)
+                return null;
+
+            try
+            {
+                return building.GetIndoors();
+            }
+            catch
+            {
+                return null;
+            }
         }
 
         private List<BotStoredEntry> ScanStoredBotObjects()
@@ -3499,6 +3917,9 @@ private static void AddScriptFooter(List<string> lines)
             if (bot == null)
                 return Game1.player?.Tile ?? Vector2.Zero;
 
+            if (IsStaleMineLocation(bot.currentLocation))
+                return Game1.player?.Tile ?? Vector2.Zero;
+
             if (namedHomeTiles.TryGetValue(bot.name ?? "", out var homeTile))
                 return homeTile;
 
@@ -3507,10 +3928,21 @@ private static void AddScriptFooter(List<string> lines)
 
         private GameLocation GetPreferredRescueLocation(BotObject bot)
         {
+            if (IsStaleMineLocation(bot?.currentLocation))
+                return Game1.player?.currentLocation ?? Game1.getLocationFromName("Farm") ?? bot?.currentLocation;
+
             if (bot != null && namedHomeTiles.ContainsKey(bot.name ?? ""))
                 return Game1.getLocationFromName("Farm") ?? bot.currentLocation;
 
             return bot?.currentLocation;
+        }
+
+        private static bool IsStaleMineLocation(GameLocation location)
+        {
+            if (location is not MineShaft)
+                return false;
+
+            return !ReferenceEquals(Game1.player?.currentLocation, location);
         }
 
         private void SeparateOverlappingBots()
@@ -3688,6 +4120,9 @@ private static void AddScriptFooter(List<string> lines)
 
         public void SafeCleanupDuplicateBots(bool dryRun, bool automatic = false)
         {
+            if (automatic)
+                dryRun = true;
+
             var snapshots = BuildBotSnapshots(validateFirst: false);
             var summary = new DedupeSummary
             {
@@ -4013,27 +4448,7 @@ private static void AddScriptFooter(List<string> lines)
                     ModEntry.instance.Monitor.Log("Bot report: null bot farmer");
                     continue;
                 }
-                bool hasAnyTool =
-                bot.inventory.Any(item =>
-                    item is Tool);
-                if (!hasAnyTool)
-                {
-                    ModEntry.instance.Monitor.Log("Bot report: bot has no tools, giving tools");
-                    bot.farmer.Items.AddRange(Farmer.initialTools());
-
-                    // Inventory indices have to exist, since InventoryMenu exclusively uses them and can't assign items otherwise.
-                    for (int i = bot.farmer.Items.Count; i < bot.GetActualCapacity(); i++) {
-                        bot.farmer.Items.Add(null);
-                    }
-                }
-                hasAnyTool =
-                bot.inventory.Any(item =>
-                    item is Tool);
-                if (!hasAnyTool)
-                {
-                    ModEntry.instance.Monitor.Log("Bot report: bot has no tools, giving tools didn't work");
-                    continue;
-                }
+                EnsureInventorySlots(bot);
                 string locName = bot.currentLocation?.NameOrUniqueName ?? "(null)";
                 var tile = bot.TileLocation;
 
@@ -4155,31 +4570,35 @@ private static void AddScriptFooter(List<string> lines)
             if (args == null || !args.IsLocalPlayer)
                 return;
 
-            if (args.OldLocation is not MineShaft || args.NewLocation is not MineShaft)
+            if (args.OldLocation is not MineShaft)
                 return;
 
             var player = args.Player ?? Game1.player;
+            var destination = args.NewLocation ?? player?.currentLocation ?? Game1.player?.currentLocation ?? Game1.getLocationFromName("Farm");
+            if (destination == null)
+                return;
+
             var preferredTile = player?.Tile ?? Game1.player?.Tile ?? Vector2.Zero;
             int moved = 0;
 
             foreach (var bot in BotManager.GetAllBots().Where(bot => ShouldFollowPlayerToMineLevel(bot, args.OldLocation)).ToList())
             {
-                if (!TryFindSafeRelocationTile(bot, args.NewLocation, preferredTile, out var targetTile))
+                if (!TryFindSafeRelocationTile(bot, destination, preferredTile, out var targetTile))
                 {
                     ModEntry.instance.Monitor.Log(
-                        $"Mine follow skipped for {bot.name}: no safe tile near {args.NewLocation.NameOrUniqueName} {preferredTile.X},{preferredTile.Y}.",
+                        $"Mine follow skipped for {bot.name}: no safe tile near {destination.NameOrUniqueName} {preferredTile.X},{preferredTile.Y}.",
                         LogLevel.Warn);
                     continue;
                 }
 
-                RelocateExistingBotInstance(bot, args.NewLocation, targetTile, "MineLevelFollow");
+                RelocateExistingBotInstance(bot, destination, targetTile, "MineLevelFollow");
                 moved++;
             }
 
             if (moved > 0)
             {
                 ModEntry.instance.Monitor.Log(
-                    $"MineLevelFollow moved {moved} bot(s) from {args.OldLocation.NameOrUniqueName} to {args.NewLocation.NameOrUniqueName}.",
+                    $"MineLevelFollow moved {moved} bot(s) from {args.OldLocation.NameOrUniqueName} to {destination.NameOrUniqueName}.",
                     LogLevel.Trace);
             }
         }

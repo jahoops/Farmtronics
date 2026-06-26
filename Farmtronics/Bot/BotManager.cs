@@ -7,6 +7,8 @@ using Microsoft.Xna.Framework;
 using StardewModdingAPI;
 using StardewModdingAPI.Events;
 using StardewValley;
+using StardewValley.Buildings;
+using StardewValley.Locations;
 using StardewValley.Objects;
 
 namespace Farmtronics.Bot {
@@ -164,7 +166,7 @@ namespace Farmtronics.Bot {
 			int count = 0;
 			
 			// Prevent issues with an open menu while converting bots to chests
-			if (!saving && Game1.activeClickableMenu is UIMenu) Game1.exitActiveMenu();
+			if (Game1.activeClickableMenu is UIMenu) Game1.exitActiveMenu();
 
 			// New approach: search all game locations.
 			if (Context.IsMainPlayer) count += ConvertBotsInMapToChests(saving: saving);
@@ -231,7 +233,7 @@ namespace Farmtronics.Bot {
 		public static int ConvertBotsInMapToChests(GameLocation inLocation = null, bool saving = true) {
 			if (inLocation == null) {
 				int totalCount = 0;
-				foreach (var loc in Game1.locations) {
+				foreach (var loc in GetLocationsForBotConversion()) {
 					totalCount += ConvertBotsInMapToChests(loc, saving);
 				}
 				return totalCount;
@@ -261,6 +263,45 @@ namespace Farmtronics.Bot {
 			}
 			//if (countInLoc > 0) ModEntry.instance.Monitor.Log($"Converted {countInLoc} bots in {inLocation.Name}");
 			return countInLoc;
+		}
+
+		private static IEnumerable<GameLocation> GetLocationsForBotConversion() {
+			var locations = new List<GameLocation>();
+
+			void AddLocation(GameLocation location) {
+				if (location == null) return;
+				if (!locations.Any(existing => ReferenceEquals(existing, location)))
+					locations.Add(location);
+			}
+
+			foreach (var loc in Game1.locations)
+				AddLocation(loc);
+
+			foreach (var farm in Game1.locations.OfType<Farm>()) {
+				foreach (var building in farm.buildings) {
+					AddLocation(GetBuildingIndoorLocation(building));
+				}
+			}
+
+			AddLocation(Game1.player?.currentLocation);
+
+			foreach (var bot in GetAllBots()) {
+				AddLocation(bot.currentLocation);
+			}
+
+			return locations;
+		}
+
+		private static GameLocation GetBuildingIndoorLocation(Building building) {
+			if (building == null)
+				return null;
+
+			try {
+				return building.GetIndoors();
+			}
+			catch {
+				return null;
+			}
 		}
 
 		//----------------------------------------------------------------------
@@ -318,7 +359,7 @@ namespace Farmtronics.Bot {
 			if (inLocation == null) {
 				// Share one seenNames across all locations so duplicates are caught globally.
 				var seenNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-				foreach (var loc in Game1.locations) {
+				foreach (var loc in GetLocationsForBotConversion()) {
 					ConvertChestsInMapToBots(loc, seenNames);
 				}
 				return;

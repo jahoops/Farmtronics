@@ -26,6 +26,8 @@ namespace Farmtronics
 
 		internal static RealFileDisk sysDisk;
 		private readonly Supervisor supervisor = new();
+		private bool convertedBotsForSave = false;
+		private uint lastBotChestRecoveryTick = 0;
 		
 		Shell shell;
 		
@@ -207,6 +209,8 @@ namespace Farmtronics
 		private void UpdateTicking(object sender, UpdateTickingEventArgs e) {
 			var gameTime = Game1.currentGameTime; //new GameTime(new TimeSpan(e.Ticks * 10000000 / 60), new TimeSpan(dTicks * 10000000 / 60));
 
+			RecoverBotChests(e.Ticks);
+
 			// update the shell here only if it is not open; if it IS open, it will
 			// be updated automatically via the UI system
 			if (shell != null && !shell.console.isOpen) shell.console.update(gameTime);
@@ -214,6 +218,18 @@ namespace Farmtronics
 			// update all bots
 			BotManager.UpdateAll(gameTime);
 			supervisor.Update(gameTime);
+		}
+
+		private void RecoverBotChests(uint tick)
+		{
+			if (!Context.IsWorldReady || convertedBotsForSave)
+				return;
+
+			if (tick - lastBotChestRecoveryTick < 60)
+				return;
+
+			lastBotChestRecoveryTick = tick;
+			BotManager.ConvertChestsToBots();
 		}
 		
 		// NOTE: Only check the mailbox once per day and only when the player warps to the farm
@@ -334,14 +350,21 @@ namespace Farmtronics
 
 		public void OnSaving(object sender, SavingEventArgs args) {
 			Monitor.Log("OnSaving");
+			if (convertedBotsForSave) {
+				Monitor.Log("OnSaving: bots already converted for this save.");
+				return;
+			}
+
 			// Host can't save without this
 			BotManager.ConvertBotsToChests(true);
 			BotManager.ClearAll();
+			convertedBotsForSave = true;
 		}
 
 		public void OnSaved(object sender, SavedEventArgs args) {
 			Monitor.Log("OnSaved");
 			BotManager.ConvertChestsToBots();
+			convertedBotsForSave = false;
 		}
 
 		public void OnSaveLoaded(object sender, SaveLoadedEventArgs args) {
@@ -358,6 +381,7 @@ namespace Farmtronics
 
 		public void OnDayStarted(object sender, DayStartedEventArgs args) {
 			Monitor.Log("OnDayStarted");
+			convertedBotsForSave = false;
 			Helper.Events.Player.Warped += OnPlayerWarped;
 
 			// Initialize the home computer and all bots for autostart.
@@ -370,8 +394,11 @@ namespace Farmtronics
 		private void OnDayEnding(object sender, DayEndingEventArgs e) {
 			Monitor.Log("OnDayEnding");
 			// Other players need to convert their inventory before OnSaving happens
-			BotManager.ConvertBotsToChests(true);
-			BotManager.ClearAll();
+			if (!convertedBotsForSave) {
+				BotManager.ConvertBotsToChests(true);
+				BotManager.ClearAll();
+				convertedBotsForSave = true;
+			}
 			// And let's also shut down the home computer, for consistency
 			if (shell != null) {
 				shell = null;		// well that was easy.

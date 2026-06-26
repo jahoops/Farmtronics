@@ -152,6 +152,7 @@ till
 clear
 mine
 machines
+all_machines
 kegs
 jars
 seedmakers
@@ -176,6 +177,7 @@ Machine bots work by capability, not by farm location.
 Existing name-prefix roles remain as defaults:
 
 ```text
+machine/machines -> All supported machines
 keg / wine       -> Kegs
 jar / preserves -> Preserves Jars
 fruit/starfruit -> Kegs and Preserves Jars
@@ -186,16 +188,22 @@ mayo            -> Mayonnaise Machines
 cheese          -> Cheese Presses
 kiln            -> Charcoal Kilns
 furnace         -> Furnaces
+loom            -> Looms
+oil             -> Oil Makers
+crystal         -> Crystalariums
 ```
 
 Machine jobs are discovered by scanning the bot's current `GameLocation`. This allows a bot inside `FarmHouse` to service indoor Kegs and Preserves Jars without cross-location pathing.
 
 Kegs have higher priority than Preserves Jars, so a `starfruit`/`fruit` bot uses Kegs first and Preserves Jars as overflow.
 
+Use `all_machines` or `machines` to allow every supported machine. Use a list of single-word machine names to restrict the bot, for example `keg jar seed oil loom crystal`.
+
 Example:
 
 ```text
 ft_bot_role "Starfruit 1" kegs jars
+ft_bot_role "Utility 1" seed oil loom crystal
 ft_bot_mode "Starfruit 1" work
 ```
 
