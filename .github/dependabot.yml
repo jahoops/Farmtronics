@@ -1,0 +1,11 @@
+version: 2
+updates:
+  - directory: "/Farmtronics"
+    open-pull-requests-limit: 5
+    package-ecosystem: "nuget"
+    reviewers:
+      - "JoeStrout"      
+    commit-message:
+      prefix: "dep nuget"
+    schedule:
+      interval: daily
